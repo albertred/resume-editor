@@ -1,0 +1,131 @@
+%-------------------------
+% Resume Template (Jake's Resume Style)
+%-------------------------
+\documentclass[letterpaper,11pt]{article}
+
+\usepackage{latexsym}
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{verbatim}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+\addtolength{\oddsidemargin}{-0.5in}
+\addtolength{\evensidemargin}{-0.5in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-.5in}
+\addtolength{\textheight}{1.0in}
+
+\urlstyle{same}
+\raggedbottom
+\raggedright
+\setlength{\tabcolsep}{0in}
+
+\titleformat{\section}{
+  \vspace{-4pt}\scshape\raggedright\large
+}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+
+%-------------------------
+% Custom commands
+%-------------------------
+\newcommand{\resumeItem}[1]{
+  \item\small{
+    {#1 \vspace{-2pt}}
+  }
+}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-2pt}\item
+    \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \textbf{#1} & #2 \\
+      \textit{\small#3} & \textit{\small #4} \\
+    \end{tabular*}\vspace{-7pt}
+}
+
+\newcommand{\resumeSubItem}[1]{\resumeItem{#1}\vspace{-4pt}}
+
+\renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
+
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
+
+%-------------------------------------------
+\begin{document}
+
+%----------HEADING----------
+\begin{center}
+    \textbf{\Huge \scshape Alex Chen} \\ \vspace{1pt}
+    \small 415-555-0192 $|$ \href{mailto:alex.chen@email.com}{alex.chen@email.com} $|$
+    \href{https://linkedin.com/in/alexchen}{linkedin.com/in/alexchen} $|$
+    \href{https://github.com/alexchen}{github.com/alexchen}
+\end{center}
+
+%-----------EDUCATION-----------
+\section{Education}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {University of California, Berkeley}{Berkeley, CA}
+      {Bachelor of Science in Computer Science}{Aug. 2017 -- May 2021}
+  \resumeSubHeadingListEnd
+
+%-----------EXPERIENCE-----------
+\section{Experience}
+  \resumeSubHeadingListStart
+
+    \resumeSubheading
+      {Software Engineer}{June 2023 -- Present}
+      {Acme Corp}{San Francisco, CA}
+      \resumeItemListStart
+        \resumeItem{Built and maintained REST APIs serving 2 million daily active users using Node.js and PostgreSQL}
+        \resumeItem{Managed a team of engineers to deliver quarterly product releases on schedule}
+        \resumeItem{Reduced API response time by 35\% through query optimization and Redis caching}
+      \resumeItemListEnd
+
+    \resumeSubheading
+      {Software Engineer Intern}{May 2022 -- Aug. 2022}
+      {Initech Solutions}{New York, NY}
+      \resumeItemListStart
+        \resumeItem{Developed React components for the customer-facing dashboard used by 50,000 users}
+        \resumeItem{Wrote unit and integration tests achieving 85\% code coverage across the frontend codebase}
+        \resumeItem{Organized company picnic and team-building events for a 30-person engineering team}
+      \resumeItemListEnd
+
+  \resumeSubHeadingListEnd
+
+%-----------PROJECTS-----------
+\section{Projects}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {OpenBudget}{github.com/alexchen/openbudget}
+      {Personal Finance Tracker}{React, Node.js, SQLite}
+      \resumeItemListStart
+        \resumeItem{Built a full-stack budgeting application with automated transaction categorization using a rule-based engine}
+        \resumeItem{Deployed on a self-hosted VPS with automated backups and uptime monitoring}
+      \resumeItemListEnd
+  \resumeSubHeadingListEnd
+
+%-----------SKILLS-----------
+\section{Technical Skills}
+ \begin{itemize}[leftmargin=0.15in, label={}]
+    \small{\item{
+     \textbf{Languages}{: Python, JavaScript, TypeScript, Go, SQL} \\
+     \textbf{Frameworks}{: React, Node.js, Express, FastAPI} \\
+     \textbf{Tools}{: Docker, AWS, Git, PostgreSQL, Redis}
+    }}
+ \end{itemize}
+
+%-------------------------------------------
+\end{document}
