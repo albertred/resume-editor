@@ -5,10 +5,12 @@ import { EditorView, basicSetup } from 'codemirror'
 import { EditorState, StateField, StateEffect, RangeSetBuilder } from '@codemirror/state'
 import { Decoration, DecorationSet, GutterMarker, gutter } from '@codemirror/view'
 
+export type AnnotationMarkKind = 'replace' | 'insert' | 'delete' | 'skills'
+
 export interface AnnotationMark {
   opId: string
   line: number       // 1-based line number
-  type: 'replace' | 'insert' | 'delete'
+  type: AnnotationMarkKind
 }
 
 interface LaTeXEditorProps {
@@ -48,6 +50,7 @@ const editorTheme = EditorView.theme({
   '.cm-annotation-replace': { backgroundColor: '#fff3d6' },
   '.cm-annotation-insert': { backgroundColor: '#e6f9ee' },
   '.cm-annotation-delete': { backgroundColor: '#fde8e8' },
+  '.cm-annotation-skills': { backgroundColor: '#e6efff' },
   '.cm-annotation-active': { outline: '1.5px solid #7c5038', outlineOffset: '-1px' },
   '.cm-annotation-gutter': { width: '14px' },
 })
@@ -107,6 +110,7 @@ const GUTTER_COLORS: Record<string, string> = {
   replace: '#e8a030',
   insert:  '#2e9e5b',
   delete:  '#d94040',
+  skills:  '#2b5fa3',
 }
 
 class AnnotationGutterMarker extends GutterMarker {

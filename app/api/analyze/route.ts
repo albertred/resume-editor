@@ -17,8 +17,8 @@ function parseJSON<T>(text: string, label: string): T {
 export async function POST(req: NextRequest) {
   const body = await req.json() as AnalyzeRequest
 
-  if (!body.jobDescription?.trim() || !body.latexSource?.trim()) {
-    return NextResponse.json({ error: 'Missing jobDescription or latexSource' }, { status: 400 })
+  if (!body.jobDescription?.trim() || !body.blocks || !body.bank) {
+    return NextResponse.json({ error: 'Missing jobDescription, blocks, or bank' }, { status: 400 })
   }
 
   try {
@@ -36,14 +36,14 @@ export async function POST(req: NextRequest) {
     const stage1Text = stage1.choices[0]?.message.content ?? ''
     const jdRequirements = parseJSON<JDRequirements>(stage1Text, 'Stage 1')
 
-    // --- Stage 2: Assess match ---
+    // --- Stage 2: Assess match (block-based) ---
     const stage2 = await client.chat.completions.create({
       model: MODEL,
       max_tokens: 1024,
       response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: STAGE2_SYSTEM },
-        { role: 'user', content: stage2UserPrompt(jdRequirements, body.latexSource) },
+        { role: 'user', content: stage2UserPrompt(jdRequirements, body.blocks, body.bank) },
       ],
     })
 

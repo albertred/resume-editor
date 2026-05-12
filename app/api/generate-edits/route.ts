@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import OpenAI from 'openai'
-import type { GenerateEditsRequest, GenerateEditsResponse, RawOperation } from '@/lib/ai/pipeline-types'
+import type { GenerateEditsRequest, GenerateEditsResponse } from '@/lib/ai/pipeline-types'
+import type { RawBlockOperation } from '@/lib/blocks/block-edit-types'
 import { stage3System, stage3UserPrompt } from '@/lib/ai/prompts'
 
 const client = new OpenAI()
@@ -9,7 +10,7 @@ const MODEL = 'gpt-4o'
 export async function POST(req: NextRequest) {
   const body = await req.json() as GenerateEditsRequest
 
-  if (!body.jdRequirements || !body.matchAssessment || !body.latexSource || !body.astSummary) {
+  if (!body.jdRequirements || !body.matchAssessment || !body.blocks || !body.bank) {
     return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
   }
 
@@ -19,14 +20,14 @@ export async function POST(req: NextRequest) {
       max_tokens: 2048,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: stage3System(body.astSummary) },
-        { role: 'user', content: stage3UserPrompt(body.jdRequirements, body.matchAssessment, body.latexSource) },
+        { role: 'system', content: stage3System(body.blocks, body.bank) },
+        { role: 'user', content: stage3UserPrompt(body.jdRequirements, body.matchAssessment, body.blocks, body.bank) },
       ],
     })
 
     const text = stage3.choices[0]?.message.content ?? ''
 
-    let parsed: { operations: RawOperation[] }
+    let parsed: { operations: RawBlockOperation[] }
     try {
       parsed = JSON.parse(text)
     } catch {

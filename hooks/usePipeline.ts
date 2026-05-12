@@ -1,41 +1,26 @@
 import { useState, useCallback } from 'react'
 import { useEditorStore } from '@/lib/store/editor-store'
-import type { ASTSummary, AnalyzeResponse, GenerateEditsResponse } from '@/lib/ai/pipeline-types'
-import type { EditOperation } from '@/lib/engine/edit-operation-types'
-import { validateOps } from '@/lib/engine/validator'
+import type { AnalyzeResponse, GenerateEditsResponse } from '@/lib/ai/pipeline-types'
+import type { BlockEditOperation, RawBlockOperation } from '@/lib/blocks/block-edit-types'
+import { validateBlockOps } from '@/lib/blocks/block-validator'
 import { parseResume } from '@/lib/latex/parser'
-import type { ResumeAST } from '@/lib/latex/ast-types'
+import { astToBlocks } from '@/lib/blocks/from-ast'
 
 export type PipelineStage = 'idle' | 'analyzing' | 'generating' | 'validating' | 'done' | 'error'
-
-function buildASTSummary(ast: ResumeAST): ASTSummary {
-  return {
-    sections: ast.sections.map((section) => ({
-      title: section.title,
-      entries: section.entries.flatMap((entry) => {
-        if (entry.kind === 'subheading') {
-          const heading: { id: string; preview: string } = {
-            id: entry.id,
-            preview: entry.args[0].slice(0, 80),
-          }
-          const items = entry.items.map((item) => ({
-            id: item.id,
-            preview: item.text.slice(0, 80),
-          }))
-          return [heading, ...items]
-        }
-        // skills node
-        return [{ id: entry.id, preview: entry.raw.slice(0, 80) }]
-      }),
-    })),
-  }
-}
 
 export function usePipeline() {
   const [stage, setStage] = useState<PipelineStage>('idle')
   const [error, setError] = useState<string | null>(null)
 
-  const { latexSource, jobDescription, ast: storedAst, setPendingOps, setPipelineStatus, setEditorialBrief } = useEditorStore()
+  const {
+    latexSource,
+    jobDescription,
+    blocks: storedBlocks,
+    bank,
+    setPendingOps,
+    setPipelineStatus,
+    setEditorialBrief,
+  } = useEditorStore()
 
   const run = useCallback(async () => {
     setError(null)
@@ -43,11 +28,14 @@ export function usePipeline() {
     setPipelineStatus('running')
 
     try {
-      // Stage 1+2: analyze JD vs resume
+      // Compute blocks (use stored or re-derive from source)
+      const blocks = storedBlocks ?? astToBlocks(parseResume(latexSource))
+
+      // Stage 1+2: analyze JD vs blocks
       const analyzeRes = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jobDescription, latexSource }),
+        body: JSON.stringify({ jobDescription, blocks, bank }),
       })
       if (!analyzeRes.ok) {
         const body = await analyzeRes.json().catch(() => ({}))
@@ -58,16 +46,12 @@ export function usePipeline() {
         setEditorialBrief(matchAssessment.editorialBrief)
       }
 
-      // Build AST summary for stage 3
-      setStage('generating')
-      const ast = storedAst ?? parseResume(latexSource)
-      const astSummary = buildASTSummary(ast)
-
       // Stage 3: generate edit operations
+      setStage('generating')
       const generateRes = await fetch('/api/generate-edits', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jdRequirements, matchAssessment, latexSource, astSummary }),
+        body: JSON.stringify({ jdRequirements, matchAssessment, blocks, bank }),
       })
       if (!generateRes.ok) {
         const body = await generateRes.json().catch(() => ({}))
@@ -77,13 +61,11 @@ export function usePipeline() {
 
       // Assign stable client-side IDs and validate
       setStage('validating')
-      const ops: EditOperation[] = rawOps.map((raw, i) => ({
-        id: `op-${Date.now()}-${i}`,
-        ...raw,
-      } as EditOperation))
-
-      const currentAst = storedAst ?? parseResume(latexSource)
-      const results = validateOps(ops, currentAst)
+      const ops: BlockEditOperation[] = rawOps.map(
+        (raw: RawBlockOperation, i: number) =>
+          ({ id: `op-${Date.now()}-${i}`, ...raw } as BlockEditOperation),
+      )
+      const results = validateBlockOps(ops, blocks, bank)
 
       setPendingOps(results)
       setPipelineStatus('done')
@@ -94,7 +76,7 @@ export function usePipeline() {
       setStage('error')
       setPipelineStatus('error')
     }
-  }, [latexSource, jobDescription, storedAst, setPendingOps, setPipelineStatus, setEditorialBrief])
+  }, [latexSource, jobDescription, storedBlocks, bank, setPendingOps, setPipelineStatus, setEditorialBrief])
 
   return { run, stage, error }
 }

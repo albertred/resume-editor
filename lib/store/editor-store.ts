@@ -1,10 +1,18 @@
 import { create } from 'zustand'
-import type { EditOperation, ValidationResult } from '../engine/edit-operation-types'
 import type { ResumeAST } from '../latex/ast-types'
 import { parseResume } from '../latex/parser'
-import { applyOp } from '../engine/applicator'
+import type { ResumeBlocks } from '../blocks/block-types'
+import { astToBlocks } from '../blocks/from-ast'
+import { blocksToLatex } from '../blocks/to-latex'
+import type { BankBlocks } from '../blocks/bank-types'
+import { masterBank } from '../blocks/master-bank'
+import type {
+  BlockEditOperation,
+  BlockValidationResult,
+} from '../blocks/block-edit-types'
+import { applyBlockOp } from '../blocks/block-applicator'
 
-export type { EditOperation }
+export type { BlockEditOperation }
 
 export interface SavedResume {
   id: string
@@ -32,8 +40,10 @@ interface EditorState {
   latexSource: string
   jobDescription: string
   pipelineStatus: 'idle' | 'running' | 'done' | 'error'
-  pendingOps: ValidationResult[]
+  pendingOps: BlockValidationResult[]
   ast: ResumeAST | null
+  blocks: ResumeBlocks | null
+  bank: BankBlocks
   /** ID of the op whose annotation popover is currently open */
   activeAnnotationId: string | null
   /** Plain-English editorial brief from Stage 2 */
@@ -47,7 +57,7 @@ interface EditorState {
   setLatexSource: (source: string) => void
   setJobDescription: (jd: string) => void
   setPipelineStatus: (status: EditorState['pipelineStatus']) => void
-  setPendingOps: (results: ValidationResult[]) => void
+  setPendingOps: (results: BlockValidationResult[]) => void
   setActiveAnnotationId: (id: string | null) => void
   setEditorialBrief: (brief: string[]) => void
   acceptOp: (opId: string) => void
@@ -60,6 +70,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   pipelineStatus: 'idle',
   pendingOps: [],
   ast: null,
+  blocks: null,
+  bank: masterBank,
   activeAnnotationId: null,
   editorialBrief: [],
   savedResumes: loadLibrary(),
@@ -67,7 +79,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   setLatexSource: (source) => {
     if (get().latexSource === source) return
     const ast = parseResume(source)
-    set({ latexSource: source, ast })
+    const blocks = ast.parseError ? null : astToBlocks(ast)
+    set({ latexSource: source, ast, blocks })
   },
 
   setJobDescription: (jd) => {
@@ -107,21 +120,25 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   },
 
   acceptOp: (opId) => {
-    const { pendingOps, latexSource, ast } = get()
+    const { pendingOps, latexSource, ast, blocks, bank } = get()
     const result = pendingOps.find((r) => r.op.id === opId)
     if (!result || !result.valid) return
+    if (!ast || !blocks) return
 
-    const currentAst = ast ?? parseResume(latexSource)
-    const { newSource, newAst, error } = applyOp(latexSource, currentAst, result.op)
-
+    const { newBlocks, error } = applyBlockOp(blocks, bank, result.op)
     if (error) {
-      console.error('[applicator] applyOp error:', error)
+      console.error('[block-applicator] error:', error)
       return
     }
+
+    const newSource = blocksToLatex(newBlocks, latexSource, ast)
+    const newAst = parseResume(newSource)
+    const reblocked = newAst.parseError ? newBlocks : astToBlocks(newAst)
 
     set({
       latexSource: newSource,
       ast: newAst,
+      blocks: reblocked,
       pendingOps: pendingOps.filter((r) => r.op.id !== opId),
     })
   },

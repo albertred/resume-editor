@@ -2,10 +2,10 @@
 
 import { useEffect, useRef } from 'react'
 import { colors } from '@/lib/ui/theme'
-import type { ValidationResult } from '@/lib/engine/edit-operation-types'
+import type { BlockValidationResult, BlockEditOperation } from '@/lib/blocks/block-edit-types'
 
 interface AnnotationPopoverProps {
-  result: ValidationResult
+  result: BlockValidationResult
   /** Pixel position relative to the editor wrapper */
   top: number
   onAccept: (id: string) => void
@@ -13,10 +13,32 @@ interface AnnotationPopoverProps {
   onClose: () => void
 }
 
-const TYPE_COLORS = {
-  replace: { bg: '#fff8ee', text: '#9a6028', label: 'Replace' },
-  insert:  { bg: '#eefff4', text: '#2e7d4f', label: 'Insert'  },
-  delete:  { bg: '#fff0f0', text: '#c0392b', label: 'Delete'  },
+const TYPE_BADGE: Record<BlockEditOperation['type'], { bg: string; text: string; label: string }> = {
+  replace_bullet:       { bg: '#fff8ee', text: '#9a6028', label: 'Replace' },
+  insert_bullet:        { bg: '#eefff4', text: '#2e7d4f', label: 'Insert'  },
+  delete_bullet:        { bg: '#fff0f0', text: '#c0392b', label: 'Delete'  },
+  edit_skills:          { bg: '#eef4ff', text: '#2b5fa3', label: 'Skills'  },
+  add_bullet_from_bank: { bg: '#eefff4', text: '#2e7d4f', label: 'Add (bank)' },
+  add_entry_from_bank:  { bg: '#eefff4', text: '#2e7d4f', label: 'Add entry' },
+  add_skill_from_bank:  { bg: '#eef4ff', text: '#2b5fa3', label: 'Add skills' },
+}
+
+function previewText(op: BlockEditOperation): string | null {
+  switch (op.type) {
+    case 'replace_bullet':
+    case 'insert_bullet':
+      return op.text
+    case 'edit_skills':
+      return `${op.categoryLabel}: ${op.items.join(', ')}`
+    case 'add_skill_from_bank':
+      return `${op.categoryLabel}: ${op.bankItems.join(', ')}`
+    case 'add_bullet_from_bank':
+      return `↑ from ${op.bankId}`
+    case 'add_entry_from_bank':
+      return `↑ from ${op.bankId}`
+    case 'delete_bullet':
+      return null
+  }
 }
 
 export default function AnnotationPopover({
@@ -27,10 +49,10 @@ export default function AnnotationPopover({
   onClose,
 }: AnnotationPopoverProps) {
   const { op, valid, error } = result
-  const badge = TYPE_COLORS[op.type]
+  const badge = TYPE_BADGE[op.type]
+  const preview = previewText(op)
   const ref = useRef<HTMLDivElement>(null)
 
-  // Close on outside click
   useEffect(() => {
     function handleClick(e: MouseEvent) {
       if (ref.current && !ref.current.contains(e.target as Node)) onClose()
@@ -39,7 +61,6 @@ export default function AnnotationPopover({
     return () => document.removeEventListener('mousedown', handleClick)
   }, [onClose])
 
-  // Close on Escape
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
       if (e.key === 'Escape') onClose()
@@ -64,7 +85,6 @@ export default function AnnotationPopover({
         overflow: 'hidden',
       }}
     >
-      {/* Header */}
       <div
         className="flex items-center justify-between px-3 py-2"
         style={{ borderBottom: `1px solid ${colors.border}`, backgroundColor: colors.headerBg }}
@@ -89,15 +109,12 @@ export default function AnnotationPopover({
         </button>
       </div>
 
-      {/* Body */}
       <div className="px-3 py-2.5 flex flex-col gap-2">
-        {/* Rationale */}
         <p className="text-xs leading-relaxed" style={{ color: colors.bodyText }}>
           {op.rationale}
         </p>
 
-        {/* New content preview */}
-        {'newContent' in op && op.newContent && (
+        {preview && (
           <pre
             className="text-xs rounded px-2 py-1.5 overflow-x-auto whitespace-pre-wrap"
             style={{
@@ -110,16 +127,14 @@ export default function AnnotationPopover({
               overflowY: 'auto',
             }}
           >
-            {op.newContent}
+            {preview}
           </pre>
         )}
 
-        {/* Validation error */}
         {!valid && error && (
           <p className="text-xs" style={{ color: '#c0392b' }}>{error}</p>
         )}
 
-        {/* Actions */}
         <div className="flex items-center gap-2 pt-0.5">
           <button
             onClick={() => { onAccept(op.id); onClose() }}

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useMemo } from 'react'
 import SplitPane from '@/components/layout/SplitPane'
-import LaTeXEditor, { type AnnotationMark } from '@/components/editor/LaTeXEditor'
+import LaTeXEditor, { type AnnotationMark, type AnnotationMarkKind } from '@/components/editor/LaTeXEditor'
 import AnnotationPopover from '@/components/editor/AnnotationPopover'
 import EditOperationList from '@/components/editor/EditOperationList'
 import JobDescriptionPanel from '@/components/jd/JobDescriptionPanel'
@@ -12,6 +12,7 @@ import { resumeTemplate } from '@/lib/templates/resume-template'
 import { colors } from '@/lib/ui/theme'
 import { parseResume } from '@/lib/latex/parser'
 import { buildNodeMap } from '@/lib/latex/ast-types'
+import type { BlockEditOperation } from '@/lib/blocks/block-edit-types'
 
 export default function Home() {
   const setLatexSource = useEditorStore((s) => s.setLatexSource)
@@ -92,20 +93,34 @@ export default function Home() {
     setShowSaveInput(false)
   }
 
-  // Build annotation marks from pendingOps + AST
+  // Build annotation marks from pendingOps + AST. Block ops reference block IDs
+  // which mirror AST node IDs (except for skills ops, where we anchor to the
+  // skills section's startIndex).
   const annotations = useMemo((): AnnotationMark[] => {
     const currentAst = ast ?? (latexSource ? parseResume(latexSource) : null)
     if (!currentAst || pendingOps.length === 0) return []
     const nodeMap = buildNodeMap(currentAst)
 
+    function anchorIdAndKind(op: BlockEditOperation): { anchorId: string; kind: AnnotationMarkKind } | null {
+      switch (op.type) {
+        case 'replace_bullet':       return { anchorId: op.targetId, kind: 'replace' }
+        case 'delete_bullet':        return { anchorId: op.targetId, kind: 'delete' }
+        case 'insert_bullet':        return { anchorId: op.afterId,  kind: 'insert' }
+        case 'add_bullet_from_bank': return { anchorId: op.afterId,  kind: 'insert' }
+        case 'add_entry_from_bank':  return null   // no on-resume anchor yet
+        case 'edit_skills':          return { anchorId: 'skills-0',  kind: 'skills' }
+        case 'add_skill_from_bank':  return { anchorId: 'skills-0',  kind: 'skills' }
+      }
+    }
+
     return pendingOps.flatMap((result) => {
-      const { op } = result
-      const targetId = op.type === 'insert' ? op.afterId : op.targetId
-      const node = nodeMap.get(targetId)
+      if (!result?.op) return []
+      const anchor = anchorIdAndKind(result.op)
+      if (!anchor) return []
+      const node = nodeMap.get(anchor.anchorId)
       if (!node) return []
-      // Convert startIndex to line number by counting newlines
       const line = latexSource.slice(0, node.startIndex).split('\n').length
-      return [{ opId: op.id, line, type: op.type }]
+      return [{ opId: result.op.id, line, type: anchor.kind }]
     })
   }, [pendingOps, ast, latexSource])
 
