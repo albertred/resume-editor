@@ -123,11 +123,6 @@ export const michelleResume = `%-------------------------
 \\newcommand{\\resumeItemListStart}{\\begin{itemize}}
 \\newcommand{\\resumeItemListEnd}{\\end{itemize}\\vspace{-5pt}}
 
-\\input{projects.tex}
-
-% Generic command: \\addproject{<Key>} inserts \\Project<Key>
-\\newcommand{\\addproject}[1]{\\csname Project#1\\endcsname}
-
 %-------------------------------------------
 %%%%%%  RESUME STARTS HERE  %%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -327,7 +322,7 @@ export const michelleResume = `%-------------------------
     %         \\resumeItem{Leveraged \\textbf{Pandas} and \\textbf{Openpyxl} for data processing and PyPDF2 for document creation}
     %       \\resumeItemListEnd
 
-% \\resumeSubHeadingListEnd
+\\resumeSubHeadingListEnd
 
 % \\section{\\textcolor{darkblue}{Hackathons}}
 %     \\resumeSubHeadingListStart

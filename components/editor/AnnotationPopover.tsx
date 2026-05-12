@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { colors } from '@/lib/ui/theme'
 import type { BlockValidationResult, BlockEditOperation } from '@/lib/blocks/block-edit-types'
 
@@ -116,9 +116,8 @@ export default function AnnotationPopover({
       </div>
 
       <div className="px-3 py-2.5 flex flex-col gap-2">
-        <p className="text-xs leading-relaxed" style={{ color: colors.bodyText }}>
-          {op.rationale}
-        </p>
+        <Rationale text={op.rationale ?? ''} />
+
 
         {preview && (
           <pre
@@ -168,5 +167,43 @@ export default function AnnotationPopover({
         </div>
       </div>
     </div>
+  )
+}
+
+const RATIONALE_COLLAPSE_THRESHOLD = 120
+
+function Rationale({ text }: { text: string }) {
+  const longEnoughToCollapse = text.length > RATIONALE_COLLAPSE_THRESHOLD
+  const [expanded, setExpanded] = useState(!longEnoughToCollapse)
+
+  if (!text) return null
+
+  if (!longEnoughToCollapse) {
+    return (
+      <p className="text-xs leading-relaxed" style={{ color: colors.bodyText }}>
+        {text}
+      </p>
+    )
+  }
+
+  return (
+    <button
+      onClick={(e) => { e.stopPropagation(); setExpanded((v) => !v) }}
+      className="text-xs leading-relaxed text-left"
+      style={{
+        color: colors.bodyText,
+        background: 'none',
+        border: 'none',
+        padding: 0,
+        cursor: 'pointer',
+        display: 'block',
+      }}
+      title={expanded ? 'Click to collapse' : 'Click to expand'}
+    >
+      {expanded ? text : text.slice(0, RATIONALE_COLLAPSE_THRESHOLD).trimEnd() + '…'}
+      <span style={{ color: colors.accent, marginLeft: 4, fontSize: 10 }}>
+        {expanded ? 'less' : 'more'}
+      </span>
+    </button>
   )
 }

@@ -1,5 +1,6 @@
 'use client'
 
+import { useState } from 'react'
 import { useEditorStore } from '@/lib/store/editor-store'
 import { PanelLabel, colors } from '@/lib/ui/theme'
 import { usePipeline } from '@/hooks/usePipeline'
@@ -13,6 +14,8 @@ export default function JobDescriptionPanel() {
 
   const editorialBrief = useEditorStore((s) => s.editorialBrief)
   const { run, stage, error } = usePipeline()
+
+  const [briefExpanded, setBriefExpanded] = useState(true)
 
   const isRunning = stage === 'analyzing' || stage === 'generating' || stage === 'validating'
   const canRun = !isRunning && jobDescription.trim().length > 0 && latexSource.trim().length > 0
@@ -43,10 +46,34 @@ export default function JobDescriptionPanel() {
           className="flex-shrink-0 px-4 py-3 flex flex-col gap-1.5"
           style={{ borderTop: `1px solid ${colors.border}`, backgroundColor: colors.headerBg }}
         >
-          <p style={{ fontSize: 10, fontWeight: 600, color: colors.labelText, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 2 }}>
-            Edit Strategy
-          </p>
-          {editorialBrief.map((line, i) => (
+          <button
+            onClick={() => setBriefExpanded((v) => !v)}
+            aria-expanded={briefExpanded}
+            className="flex items-center gap-1.5 text-left"
+            style={{ marginBottom: briefExpanded ? 2 : 0, padding: 0, background: 'none', border: 'none' }}
+          >
+            <span
+              style={{
+                color: colors.mutedText,
+                fontSize: 10,
+                width: 10,
+                display: 'inline-block',
+                transition: 'transform 0.15s',
+                transform: briefExpanded ? 'rotate(90deg)' : 'rotate(0deg)',
+              }}
+            >
+              ▸
+            </span>
+            <span style={{ fontSize: 10, fontWeight: 600, color: colors.labelText, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+              Edit Strategy
+            </span>
+            {!briefExpanded && (
+              <span style={{ fontSize: 10, color: colors.mutedText, marginLeft: 4 }}>
+                ({editorialBrief.length} {editorialBrief.length === 1 ? 'point' : 'points'})
+              </span>
+            )}
+          </button>
+          {briefExpanded && editorialBrief.map((line, i) => (
             <div key={i} className="flex items-start gap-1.5">
               <span style={{ color: colors.accent, fontSize: 10, marginTop: 2, flexShrink: 0 }}>▸</span>
               <p style={{ fontSize: 12, color: colors.bodyText, lineHeight: 1.5 }}>{line}</p>

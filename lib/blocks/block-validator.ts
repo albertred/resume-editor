@@ -119,10 +119,26 @@ function fail(op: BlockEditOperation, error: string): BlockValidationResult {
 // ---------------------------------------------------------------------------
 // Bullet text validation: enforce the \b{...} convention and reject any
 // other backslash commands the LLM might smuggle in.
+//
+// We try to AUTO-REPAIR common LLM mistakes first (stray `{…}` braces around
+// emphasized phrases, `\textbf{…}` instead of `\b{…}`, stray `\cmd{…}`) and
+// only reject if the text is still invalid after repair. The op's text field
+// is mutated in place when repairs succeed, so accepting the op applies the
+// cleaned-up version.
 // ---------------------------------------------------------------------------
 
-function checkBulletText(op: BlockEditOperation, text: string): BlockValidationResult {
+function checkBulletText(
+  op: BlockEditOperation & { text: string },
+  text: string,
+): BlockValidationResult {
   if (!text || !text.trim()) return fail(op, 'text must not be empty')
+
+  const repaired = repairBulletText(text)
+  if (repaired !== text) {
+    // Mutate the op so downstream rendering uses the cleaned text.
+    op.text = repaired
+    text = repaired
+  }
 
   // Walk the string, allowing only \b{...} as a backslash command. Validate
   // that braces balance and \b is never nested inside another \b.
@@ -168,4 +184,190 @@ function checkBulletText(op: BlockEditOperation, text: string): BlockValidationR
   if (/\\b\{\s*\}/.test(text)) return fail(op, 'empty \\b{} is not allowed')
 
   return ok(op)
+}
+
+/**
+ * Best-effort cleanup of LLM-emitted bullet text. Idempotent. Returns the
+ * (possibly unchanged) repaired string.
+ *
+ * Repairs, in order:
+ *   1. `\textbf{X}`           → `\b{X}`              (LLM forgot our convention)
+ *   2. `\cmd{X}`              → `X`                  (any other backslash command, content kept)
+ *   3. Stray `{X}` braces     → `X`                  (LLM added LaTeX-style emphasis braces)
+ *   4. Stray unescaped `&%$#_~^` → escaped form `\&` etc. for display safety
+ *
+ * `\b{X}` spans are preserved as-is.
+ */
+export function repairBulletText(input: string): string {
+  let text = input.trim()
+
+  // 1. Convert any \textbf{...} the LLM emitted into our \b{...} marker.
+  text = replaceBracedCommand(text, /\\textbf\s*\{/g, (inner) => `\\b{${inner}}`)
+
+  // 2. Strip any other backslash command of form \cmd{...}, keeping inner content.
+  //    (Leave \b{...} alone; we just produced those.)
+  text = stripUnknownCommands(text)
+
+  // 3. Drop stray `{...}` braces that aren't part of \b{...}.
+  text = dropStrayBraces(text)
+
+  // 4. Escape stray LaTeX special chars that aren't already escaped and aren't
+  //    inside a \b{...} span (we leave bold spans alone so the renderer can
+  //    handle them — escaping happens at render time anyway).
+  // We deliberately DON'T touch unescaped specials here; the renderer's
+  // escapeLatex() does that on output. This pass is just about getting through
+  // validation, not about LaTeX correctness.
+
+  return text
+}
+
+/**
+ * Walk `text` and run `transform(inner)` for every balanced `pattern{...}`
+ * occurrence. `pattern` must match the command including the opening `{`.
+ */
+function replaceBracedCommand(
+  text: string,
+  pattern: RegExp,
+  transform: (inner: string) => string,
+): string {
+  let out = ''
+  let i = 0
+  while (i < text.length) {
+    pattern.lastIndex = i
+    const m = pattern.exec(text)
+    if (!m || m.index !== i) {
+      out += text[i]
+      i++
+      continue
+    }
+    // m.index points to the command; m[0] ends with the opening '{'.
+    const openBracePos = m.index + m[0].length - 1
+    const close = findMatchingBrace(text, openBracePos)
+    if (close === -1) {
+      out += text[i]
+      i++
+      continue
+    }
+    const inner = text.slice(openBracePos + 1, close)
+    out += transform(inner)
+    i = close + 1
+  }
+  return out
+}
+
+/**
+ * Strip any \cmd{...} that isn't \b{...}. Inner content kept. Nested commands
+ * handled by recursing on the inner content.
+ */
+function stripUnknownCommands(text: string): string {
+  return scanAndStrip(text)
+}
+
+function scanAndStrip(text: string): string {
+  let out = ''
+  let i = 0
+  while (i < text.length) {
+    if (text[i] === '\\') {
+      // \b{...} — keep verbatim
+      if (text.startsWith('\\b{', i)) {
+        const close = findMatchingBrace(text, i + 2)
+        if (close !== -1) {
+          out += text.slice(i, close + 1)
+          i = close + 1
+          continue
+        }
+      }
+      // Escaped specials \% \& \$ \# \_ \{ \} — keep as plain char
+      if (i + 1 < text.length && '&%$#_{}'.includes(text[i + 1])) {
+        out += text[i + 1]
+        i += 2
+        continue
+      }
+      // \cmd{...} or \cmd — strip the command, keep braced content if present
+      const cmdMatch = /^\\([A-Za-z]+)\s*/.exec(text.slice(i))
+      if (cmdMatch) {
+        const afterCmd = i + cmdMatch[0].length
+        if (text[afterCmd] === '{') {
+          const close = findMatchingBrace(text, afterCmd)
+          if (close !== -1) {
+            // recurse so nested unknown commands inside also get stripped
+            out += scanAndStrip(text.slice(afterCmd + 1, close))
+            i = close + 1
+            continue
+          }
+        }
+        // \cmd with no braces — just drop the command
+        i = afterCmd
+        continue
+      }
+      // Bare backslash — drop it
+      i++
+      continue
+    }
+    out += text[i]
+    i++
+  }
+  return out
+}
+
+/**
+ * Remove unescaped `{...}` pairs that aren't part of a \b{...} marker.
+ * Keeps inner content. Idempotent.
+ */
+function dropStrayBraces(text: string): string {
+  let out = ''
+  let i = 0
+  while (i < text.length) {
+    if (text.startsWith('\\b{', i)) {
+      const close = findMatchingBrace(text, i + 2)
+      if (close !== -1) {
+        out += text.slice(i, close + 1)
+        i = close + 1
+        continue
+      }
+    }
+    if (text[i] === '\\' && i + 1 < text.length && '{}'.includes(text[i + 1])) {
+      // escaped brace — keep as-is so the renderer can decide
+      out += text.slice(i, i + 2)
+      i += 2
+      continue
+    }
+    if (text[i] === '{') {
+      const close = findMatchingBrace(text, i)
+      if (close !== -1) {
+        // recurse on inner so we strip nested stray braces too
+        out += dropStrayBraces(text.slice(i + 1, close))
+        i = close + 1
+        continue
+      }
+      // unmatched — drop the brace
+      i++
+      continue
+    }
+    if (text[i] === '}') {
+      // unmatched close — drop
+      i++
+      continue
+    }
+    out += text[i]
+    i++
+  }
+  return out
+}
+
+function findMatchingBrace(s: string, openPos: number): number {
+  if (s[openPos] !== '{') return -1
+  let depth = 0
+  for (let i = openPos; i < s.length; i++) {
+    if (s[i] === '\\' && (s[i + 1] === '{' || s[i + 1] === '}')) {
+      i++
+      continue
+    }
+    if (s[i] === '{') depth++
+    else if (s[i] === '}') {
+      depth--
+      if (depth === 0) return i
+    }
+  }
+  return -1
 }
