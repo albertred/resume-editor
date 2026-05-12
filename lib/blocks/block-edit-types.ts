@@ -75,6 +75,26 @@ export interface AddSkillFromBankOp {
   rationale: string
 }
 
+/** Insert an \addproject{Key} line referencing a project from projects.tex. */
+export interface AddProjectFromBankOp {
+  id: string
+  type: 'add_project_from_bank'
+  /** Project key, must exist in the bank as id "proj-bank-<bankKey>". */
+  bankKey: string
+  /** Insertion index within the projects section; omit to append. */
+  position?: number
+  rationale: string
+}
+
+/** Remove an \addproject{Key} line currently on the resume. */
+export interface RemoveBankedProjectOp {
+  id: string
+  type: 'remove_banked_project'
+  /** ID of the banked project on the resume, e.g. "proj-bank-<Key>" */
+  targetId: string
+  rationale: string
+}
+
 export type BlockEditOperation =
   | ReplaceBulletOp
   | InsertBulletOp
@@ -83,6 +103,8 @@ export type BlockEditOperation =
   | AddBulletFromBankOp
   | AddEntryFromBankOp
   | AddSkillFromBankOp
+  | AddProjectFromBankOp
+  | RemoveBankedProjectOp
 
 export type BlockEditOperationType = BlockEditOperation['type']
 

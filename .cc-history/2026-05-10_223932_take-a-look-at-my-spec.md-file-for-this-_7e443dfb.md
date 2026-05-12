@@ -6,8 +6,8 @@
 | **Session ID** | `7e443dfb-d9b2-4a70-ac63-eb8fa52085f3` |
 | **Working Dir** | `/Users/michellelu/project_folder/resume-editor` |
 | **Started** | 5/10/2026, 10:39:32 PM |
-| **Last Updated** | 5/11/2026, 11:46:17 PM |
-| **Messages** | 265 |
+| **Last Updated** | 5/12/2026, 2:08:06 PM |
+| **Messages** | 523 |
 
 ---
 
@@ -5663,6 +5663,4608 @@ here is my specific resume that i use. currently, our application is still not r
 
 %-------------------------------------------
 \end{document}
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:47:06 PM</sup>
+
+This is hugely useful — your real resume reveals a bunch of assumptions our parser/renderer makes that don't hold. Let me catalog what I see and what to do, without making changes yet.
+
+## What breaks against your actual resume
+
+**1. Commented-out blocks are invisible to the LLM but live in the source.** You comment out experiences/projects to swap them in/out — this is your workflow's *primary* affordance, and our system has no concept of it. Worse: when the applicator rewrites a section's body, the parser-derived range covers the whole section, but commented-out `% \resumeSubheading{...}` lines never make it into the AST. Today, accepting *any* edit would silently delete every commented block in that section. That's catastrophic for your workflow.
+
+**2. Custom macros our parser doesn't know.** Your file uses:
+- `\resumeSubheadingSecond` (6-arg, two-line subheading — your Education entry)
+- `\resumeProjectHeading` (2-arg project header — *all* your projects use this, not `\resumeSubheading`)
+- `\addproject{Key}` (pulls projects from `projects.tex` via `\csname Project#1\endcsname`)
+- `\resumeSubSubheading` (multi-position pattern)
+
+Our parser only looks for `\resumeSubheading`, so your **Projects section parses to zero entries** and your **Education entry is missed too**. The block model has nothing for the LLM to target there.
+
+**3. External `\input{projects.tex}` + `\addproject` macro indirection.** Your projects are stored *outside* this file and pulled in by key. Our parser only sees the active `.tex` we get; it has no idea the bank of project keys exists. This is actually *exactly* the content-bank concept — you already have one, in LaTeX.
+
+**4. Section titles wrapped in `\textcolor{darkblue}{...}`.** Our `SECTION_TYPE_MAP` matches on the title string. `\textcolor{darkblue}{Education}` doesn't match `"education"`, so the section type falls through to the default `'experience'` for every section. That's why everything might appear miscategorized.
+
+**5. Section title is `Technical Skills` — our map handles that, but our skills parser regex expects `\textbf{Label}{: items}` on one line.** Yours has `\textbf{Languages}{: TypeScript, Python, C++, C} \\` — that should match — but with commented-out items inside the braces (`% \href{...}{...}`), the regex would silently grab the wrong content. Need to verify.
+
+**6. Rich inline LaTeX our `\b{...}` convention can't represent**, present in your bullets and headers:
+- `\href{...}{...}` links inside subheading args and project names (`Spotify MCP`, arXiv link, Notion Notes Agent)
+- `\scriptsize{\faLink\ }` icons after linked titles
+- `\textcolor{...}{...}`, `\underline{...}` in the header
+- `\emph{...}` for tech stack lists in projects
+- `\textbar`, `~` non-breaking spaces
+
+Our `latexToBulletText` strips `\textbf` but passes the rest through verbatim; the validator then *rejects* the bullet as containing forbidden commands. The LLM gets fields it can never legally edit.
+
+**7. Education has 6 fields, not 4.** `\resumeSubheadingSecond` takes `{school}{location}{degree-line-1}{dates}{relevant-courses-label}{courses}`. Our `EducationEntryBlock` schema has only 4 args.
+
+**8. Single-author file with a heavy preamble and `\input`** — the renderer's section-splicing approach is safer than I expected (it preserves the preamble), but it can't preserve mid-section comments that aren't between sections.
+
+## What this points to for the system
+
+A few categories of change. I'd weight them roughly in this order:
+
+**A. First-class "commented-out alternates" support.** This is your workflow, not a corner case. Concrete idea: the parser also scans for commented-out `\resumeSubheading` / `\resumeProjectHeading` blocks within each section and surfaces them as `disabled: true` entries in the blocks. The LLM sees them in a separate "alternates" list (essentially: your bank already lives *inside* the file). New op types: `enable_entry { entryId }` and `disable_entry { entryId }` toggle commenting. Renderer wraps/unwraps the entry in `% `. This means *your existing workflow becomes the bank* — you don't have to maintain a separate `master-bank.ts`.
+
+**B. Template-aware parsing for your macro set.** Either:
+- Hardcode the additional macros (`\resumeProjectHeading`, `\resumeSubheadingSecond`, `\addproject`), or
+- Introduce a small `TemplateDefinition` config (macro name → entry shape) so your specific dialect is data, not code. Given you've heavily customized Jake's, the config approach pays off.
+
+**C. Section title normalization.** Strip `\textcolor{...}{TITLE}` and other wrappers before matching against `SECTION_TYPE_MAP`. Trivial fix, prevents the silent miscategorization.
+
+**D. Decide what to do with inline LaTeX in fields the LLM might edit.** Two options:
+- *Conservative:* mark any bullet/header field containing forbidden commands (`\href`, `\textcolor`, etc.) as **read-only** in the blocks. The LLM sees them but can't emit a replace_bullet for them. Your hand-formatted links stay intact.
+- *Expressive:* extend the inline markup beyond `\b{...}` to support `\link{url}{text}` and `\icon{name}`. More work, more ways for the LLM to mess up. I'd start conservative.
+
+**E. Support `\input{projects.tex}` + `\addproject{...}`.** Two paths:
+- Read `projects.tex`, parse the `\newcommand{\ProjectX}{...}` definitions into project blocks, expose as a bank where `add_entry_from_bank` emits a new `\addproject{X}` line rather than inlining the body.
+- Ignore for MVP, treat `\addproject{X}` calls as opaque "external entries" that can be reordered/deleted but not edited.
+The first option is much more useful — it makes our bank concept and your existing pattern the same thing.
+
+**F. Drop the synthetic master-bank.** Your real bank is (1) your commented-out blocks and (2) `projects.tex`. Stop seeding `lib/blocks/master-bank.ts` with sample data — derive the bank from your actual file(s) instead.
+
+**G. Education schema.** Extend `EducationEntryBlock` to handle the 6-arg `\resumeSubheadingSecond` shape (add `degreeLine: string` and `extras: { label, items: string[] }` or similar). Or, if education is rarely AI-edited anyway, just mark it read-only.
+
+## Recommended first cut
+
+If I were prioritizing for *your* daily use, I'd do — in order:
+
+1. **C (title normalization)** — 10 minutes, unblocks everything else.
+2. **B (parse `\resumeProjectHeading`)** — without this, Projects is invisible.
+3. **D-conservative (mark fields with forbidden inline LaTeX as read-only)** — protects your hand-tuned links.
+4. **A (commented-out blocks as alternates + enable/disable ops)** — this is the killer feature for your workflow.
+5. **E (parse `projects.tex`)** — turns your real project bank into the LLM's bank.
+6. **F (drop sample bank)**.
+7. **G (education 6-arg)** — only if education edits matter.
+
+Want me to write this up as an updated plan file? And — for the read-only-fields decision (D), do you want me to go conservative (LLM cannot touch any bullet containing `\href`, `\textcolor`, etc.) or attempt the expressive path with `\link{}{}` markup?
+
+
+---
+
+## User <sup>5/11/2026, 11:48:54 PM</sup>
+
+yes, create a plan file. however, note that i am ok with removing all these commented parts from my (default) resume for the app, but these commented out activities need to go into a bank or something where we have an easy mechanism of switching them out
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:48:59 PM</sup>
+
+Good — that simplifies things. The bank becomes the home for those alternates, and the live resume stays clean. Let me draft the plan.
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:50:12 PM</sup>
+
+<details>
+<summary>Tool: <code>Write</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/.claude/plans/real-resume-fit.md",
+  "content": "# Plan: Fit the app to Michelle's real Jake-template resume\n\n## Context\n\nThe block-model rewrite assumed a clean, vanilla Jake's template. Michelle's actual resume diverges in ways that make the current pipeline mis-parse or silently destroy content:\n\n1. **Custom macros** — `\\resumeSubheadingSecond` (6-arg education), `\\resumeProjectHeading` (2-arg project header), `\\resumeSubSubheading`, `\\addproject{Key}` — none of which the parser knows about. Projects parses to 0 entries today.\n2. **Colored section titles** — `\\section{\\textcolor{darkblue}{Education}}` doesn't match `SECTION_TYPE_MAP`, so every section silently falls through to `'experience'`.\n3. **Rich inline LaTeX in editable fields** — `\\href{...}{...}`, `\\scriptsize{\\faLink\\ }`, `\\textcolor{...}`, `\\emph{...}`, `\\textbar` — these appear in bullets and headers. Our `\\b{...}`-only validator would reject any LLM edit touching them.\n4. **Commented-out alternates** — Michelle uses inline comments to keep additional experiences/projects in the same file and toggle them in/out by uncommenting. The current applicator would silently delete every commented block when it rewrites a section.\n5. **`\\input{projects.tex}` + `\\addproject{Key}`** — Projects live in a separate file and are pulled in by key. The parser has no visibility.\n6. **Skills line has inline comments inside the braces** — risks the regex grabbing wrong content.\n\nMichelle is fine **removing the inline commented-out alternates from the working resume**, *if* they're moved into a content bank with a clean UI mechanism to swap them in. That removes the most dangerous foot-gun (silent comment deletion) and turns her existing workflow into a first-class feature.\n\nOutcome: the app understands Michelle's actual template dialect, parses every section correctly, never destroys her hand-formatted inline LaTeX, and the bank becomes the central place f
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:50:31 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+File created successfully at: /Users/michellelu/.claude/plans/real-resume-fit.md (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:50:41 PM</sup>
+
+Plan written to [/Users/michellelu/.claude/plans/real-resume-fit.md](/Users/michellelu/.claude/plans/real-resume-fit.md).
+
+The headline shifts based on your input:
+
+- **Bank becomes the home for both commented alternates and `projects.tex`.** Same mechanism, two importers. Your "comment out to swap" workflow becomes a UI toggle backed by `localStorage`.
+- **Conservative read-only enforcement** for bullets/fields containing `\href`, `\textcolor`, `\faLink`, etc. — protects your hand-formatted links from being clobbered. The LLM sees them for context but can't target them.
+- **`\addproject{Key}` is first-class** — new ops `add_project_from_bank` / `remove_banked_project` let the LLM swap projects in/out by key, matching how you already work.
+- **Execution order is staged so steps 1–3 alone unblock daily use** (parser sees your real sections, nothing gets destroyed), and 4–7 build the bank workflow.
+
+Two things worth flagging before I'd start implementing:
+
+1. The "extract alternates" importer runs on demand — it's destructive to the source (strips the comments), so it needs a confirm-and-undo. I'd put it behind a one-time migration banner rather than a button that's always visible.
+2. The bank persistence is `localStorage` for MVP. If you want it shared across machines / backed up, that's a later step (file export, or Supabase).
+
+Want me to start with steps 1–3?
+
+
+---
+
+## User <sup>5/11/2026, 11:53:18 PM</sup>
+
+add a step for making my resume the default / saved resume in the app
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:53:30 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/.claude/plans/real-resume-fit.md",
+  "old_string": "## Recommended execution order\n\n1. **Parser fixes** (§1, §2) — title normalization + `\\resumeSubheadingSecond` + `\\resumeProjectHeading`. Without these, Education and Projects are invisible. (Smallest change with the biggest visible win.)\n2. **Block shape updates + read-only flags** (§3, §4) — every field/bullet correctly classified.\n3. **Renderer updates for new macros + raw passthrough** (§7).\n4. **Importer for commented alternates → bank** (§5) + remove `master-bank.ts` sample data.\n5. **`\\addproject` + projects.tex importer** (§6, new ops in §8).\n6. **Prompt updates** (§9).\n7. **Bank panel UI** (§10).\n\nSteps 1–3 alone should make the app *usable* on Michelle's real resume (no more silent miscategorization, no more destroyed inline LaTeX). 4–7 deliver the workflow improvement.",
+  "new_string": "## Recommended execution order\n\n1. **Parser fixes** (§1, §2) — title normalization + `\\resumeSubheadingSecond` + `\\resumeProjectHeading`. Without these, Education and Projects are invisible. (Smallest change with the biggest visible win.)\n2. **Block shape updates + read-only flags** (§3, §4) — every field/bullet correctly classified.\n3. **Renderer updates for new macros + raw passthrough** (§7).\n4. **Make Michelle's resume the default + auto-saved** (§11).\n5. **Importer for commented alternates → bank** (§5) + remove `master-bank.ts` sample data.\n6. **`\\addproject` + projects.tex importer** (§6, new ops in §8).\n7. **Prompt updates** (§9).\n8. **Bank panel UI** (§10).\n\nSteps 1–3 alone should make the app *usable* on Michelle's real resume (no more silent miscategorization, no more destroyed inline LaTeX). 4 makes it open on her resume by default. 5–8 deliver the workflow improvement."
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:53:32 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/.claude/plans/real-resume-fit.md has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:53:46 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/.claude/plans/real-resume-fit.md",
+  "old_string": "### 10. UI changes",
+  "new_string": "### 11. Michelle's resume as the default + auto-saved ([lib/templates/](resume-editor/lib/templates/), [lib/store/editor-store.ts](resume-editor/lib/store/editor-store.ts), [app/page.tsx](resume-editor/app/page.tsx))\n\nToday the app opens with the bundled \"Alex Chen\" sample. That's noise for daily use. Switch the default to Michelle's real resume *and* keep her edits sticky across reloads.\n\n- **Bundle Michelle's resume as the default template.** Add `lib/templates/michelle-resume.ts` exporting `michelleResume: string` (her sanitized current resume — i.e. the version after the §5 importer has pulled commented alternates into the bank). Replace `lib/templates/resume-template.ts` references with this new module, or rename for clarity (`default-resume.ts`). The Alex Chen sample can stay around behind a \"Load sample\" menu item but isn't loaded automatically.\n- **Auto-persist the working resume.** Today the store only saves on explicit \"Save\". Add an `autosave` slot in `localStorage` (key `resume-editor:autosave`) that the store writes to (debounced ~500ms) on every `setLatexSource`. On mount, the store hydrates from `:autosave` if present; otherwise it falls back to `michelleResume`. This way Michelle's edits survive reloads without her having to remember to save.\n- **Reset affordance.** A \"Reset to default\" item in the toolbar clears `:autosave` and reloads `michelleResume`. Confirms before destroying current source.\n- **Library remains separate.** The existing named-save library (`resume-editor:library`) is untouched — it's for *snapshots* per job application. Autosave is the live working copy.\n- **No version control in MVP.** Single autosave slot. If we want history later, the named-save mechanism already exists for that.\n\n### 10. UI changes"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:53:49 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/.claude/plans/real-resume-fit.md has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:53:55 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/.claude/plans/real-resume-fit.md",
+  "old_string": "- [lib/store/editor-store.ts](resume-editor/lib/store/editor-store.ts) — bank persistence in `localStorage`.\n- New bank panel component under [components/bank/](resume-editor/components/bank/).",
+  "new_string": "- [lib/store/editor-store.ts](resume-editor/lib/store/editor-store.ts) — bank persistence + autosave in `localStorage`; hydrate from autosave on mount.\n- [lib/templates/michelle-resume.ts](resume-editor/lib/templates/michelle-resume.ts) (new) — default resume bundled with the app.\n- New bank panel component under [components/bank/](resume-editor/components/bank/)."
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:53:58 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/.claude/plans/real-resume-fit.md has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:54:07 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/.claude/plans/real-resume-fit.md",
+  "old_string": "6. **End-to-end with JD**: paste a real SWE JD → Stage 3 produces ops that reference real IDs from Michelle's resume → no ops target read-only bullets → accepted ops produce valid LaTeX that still compiles.",
+  "new_string": "6. **End-to-end with JD**: paste a real SWE JD → Stage 3 produces ops that reference real IDs from Michelle's resume → no ops target read-only bullets → accepted ops produce valid LaTeX that still compiles.\n7. **Default + autosave**: fresh load (clear `localStorage`) opens Michelle's resume, not Alex Chen. Make an edit, reload — edit persists. Click \"Reset to default\" → confirms → restores `michelleResume` and clears autosave."
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:54:10 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/.claude/plans/real-resume-fit.md has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:54:16 PM</sup>
+
+Added §11 covering three things:
+
+- **Bundle Michelle's resume as the default** (replaces the Alex Chen sample on first load).
+- **Autosave to `localStorage`** on every edit so her working copy survives reloads without manual saves. Hydrates from autosave on mount, falls back to the bundled default.
+- **"Reset to default" affordance** for going back to the bundled version (with a confirm).
+
+Inserted as step 4 in the execution order since it's small, independent, and dramatically improves daily ergonomics. The existing named-save library stays untouched — that's still where you snapshot per-application versions. Verification step 7 added too.
+
+
+---
+
+## User <sup>5/11/2026, 11:55:00 PM</sup>
+
+<ide_opened_file>The user opened the file /Users/michellelu/project_folder/resume-editor/temp in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+ive stored my resume in a file called temp. continue with implementation of this plan
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:55:07 PM</sup>
+
+I'll start with the plan. First let me read your resume so I know what I'm fitting to.
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:55:07 PM</sup>
+
+<details>
+<summary>Tool: <code>Read</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/temp"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:55:07 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+1	%-------------------------
+2	% Resume in Latex
+3	% Author 
+4	% Based off of: 
+5	% License : MIT
+6	%------------------------
+7	
+8	\documentclass[letterpaper,11pt]{article}
+9	
+10	\usepackage{latexsym}
+11	\usepackage[empty]{fullpage}
+12	\usepackage{titlesec}
+13	\usepackage{marvosym}
+14	\usepackage[usenames,dvipsnames]{color}
+15	\usepackage{verbatim}
+16	\usepackage{enumitem}
+17	\usepackage[hidelinks]{hyperref}
+18	\usepackage{fancyhdr}
+19	\usepackage[english]{babel}
+20	\usepackage{tabularx}
+21	\usepackage[table]{xcolor}
+22	\definecolor{myblue}{HTML}{1F77B4} 
+23	\definecolor{darkblue}{HTML}{165682}
+24	\input{glyphtounicode}
+25	\usepackage{fontawesome5}
+26	
+27	% \usepackage{hyperref}
+28	% \hypersetup{
+29	%   colorlinks=true,        % coloured text instead of coloured boxes
+30	%   linkcolor=myblue,       % internal links (sections, equations)
+31	%   urlcolor=myblue,        % bare URLs and \href
+32	%   citecolor=myblue        % bibliography links
+33	% }
+34	
+35	
+36	%----------FONT OPTIONS-----
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:55:13 PM</sup>
+
+Now I'll set up todos for the implementation, following the staged execution order from the plan.
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:55:18 PM</sup>
+
+<details>
+<summary>Tool: <code>TodoWrite</code></summary>
+
+```json
+{
+  "todos": [
+    {
+      "content": "Step 1: Parser fixes — title normalization + \\resumeSubheadingSecond + \\resumeProjectHeading + \\addproject",
+      "activeForm": "Implementing parser fixes (title normalization + new macros)",
+      "status": "in_progress"
+    },
+    {
+      "content": "Step 2: Block shape updates + read-only flags",
+      "activeForm": "Updating block shapes and adding read-only flags",
+      "status": "pending"
+    },
+    {
+      "content": "Step 3: Renderer updates for new macros + raw passthrough",
+      "activeForm": "Updating renderer for new macros + raw passthrough",
+      "status": "pending"
+    },
+    {
+      "content": "Step 4: Bundle Michelle's resume as default + autosave + reset",
+      "activeForm": "Bundling default resume + autosave + reset",
+      "status": "pending"
+    },
+    {
+      "content": "Step 5: Comment-importer + remove sample bank",
+      "activeForm": "Implementing comment-importer and removing sample bank",
+      "status": "pending"
+    },
+    {
+      "content": "Step 6: \\addproject + projects.tex importer + new ops",
+      "activeForm": "Implementing \\addproject + projects.tex importer",
+      "status": "pending"
+    },
+    {
+      "content": "Step 7: Prompt updates for new ops + read-only rule",
+      "activeForm": "Updating prompts for new ops + read-only",
+      "status": "pending"
+    },
+    {
+      "content": "Step 8: Bank panel UI",
+      "activeForm": "Building bank panel UI",
+      "status": "pending"
+    },
+    {
+      "content": "Final: typecheck + build",
+      "activeForm": "Running typecheck + build",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:55:18 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:55:26 PM</sup>
+
+I notice your resume's `\resumeSubheadingSecond` has Education arg order `{school}{location}{degreeLine}{dates}{extrasLabel}{extras}`. And section titles are `\section{\textcolor{darkblue}{...}}`.
+
+Let me start with **Step 1: Parser fixes**. I'll extend `parser.ts` and `ast-types.ts` to recognize the new macros and normalize titles.
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:55:35 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/ast-types.ts",
+  "old_string": "export interface SubheadingNode {\n  kind: 'subheading'\n  /** Stable ID: \"<sectionPrefix>-<idx>\"  e.g. \"exp-0\", \"edu-0\", \"proj-0\" */\n  id: string\n  /** The four arguments to \\resumeSubheading{arg1}{arg2}{arg3}{arg4} */\n  args: [string, string, string, string]\n  items: ItemNode[]\n  /** Covers from \\resumeSubheading through the closing \\resumeItemListEnd (or next entry) */\n  startIndex: number\n  endIndex: number\n}",
+  "new_string": "export interface SubheadingNode {\n  kind: 'subheading'\n  /** Stable ID: \"<sectionPrefix>-<idx>\"  e.g. \"exp-0\", \"edu-0\", \"proj-0\" */\n  id: string\n  /**\n   * 'standard' = \\resumeSubheading{a}{b}{c}{d}  (4 args)\n   * 'second'   = \\resumeSubheadingSecond{a}{b}{c}{d}{e}{f}  (6 args)\n   */\n  variant: 'standard' | 'second'\n  /** Raw arguments to the macro; length 4 for 'standard', 6 for 'second' */\n  args: string[]\n  items: ItemNode[]\n  startIndex: number\n  endIndex: number\n}\n\n/** \\resumeProjectHeading{heading}{dates}  — used for inline project entries */\nexport interface ProjectHeadingNode {\n  kind: 'project-heading'\n  id: string                 // \"proj-N\"\n  /** Raw first arg (often contains \\href, \\emph, \\textbf, etc.) */\n  heading: string\n  /** Raw second arg (dates or empty) */\n  dates: string\n  items: ItemNode[]\n  startIndex: number\n  endIndex: number\n}\n\n/** \\addproject{Key}  — references a project defined in projects.tex */\nexport interface BankedProjectNode {\n  kind: 'banked-project'\n  id: string                 // \"proj-bank-<Key>\"\n  bankKey: string            // \"<Key>\"\n  startIndex: number\n  endIndex: number\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:55:36 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/latex/ast-types.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:55:43 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/ast-types.ts",
+  "old_string": "export type EntryNode = SubheadingNode | SkillsNode",
+  "new_string": "export type EntryNode = SubheadingNode | SkillsNode | ProjectHeadingNode | BankedProjectNode"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:55:44 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/latex/ast-types.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:55:58 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/ast-types.ts",
+  "old_string": "/** Flatten all nodes (subheadings, items, skills) into a single lookup map */\nexport function buildNodeMap(ast: ResumeAST): Map<string, SubheadingNode | ItemNode | SkillsNode> {\n  const map = new Map<string, SubheadingNode | ItemNode | SkillsNode>()\n  for (const section of ast.sections) {\n    for (const entry of section.entries) {\n      map.set(entry.id, entry)\n      if (entry.kind === 'subheading') {\n        for (const item of entry.items) {\n          map.set(item.id, item)\n        }\n      }\n    }\n  }\n  return map\n}",
+  "new_string": "/** Flatten all nodes (subheadings, projects, items, skills, banked) into a single lookup map */\nexport function buildNodeMap(\n  ast: ResumeAST,\n): Map<string, SubheadingNode | ProjectHeadingNode | BankedProjectNode | ItemNode | SkillsNode> {\n  const map = new Map<\n    string,\n    SubheadingNode | ProjectHeadingNode | BankedProjectNode | ItemNode | SkillsNode\n  >()\n  for (const section of ast.sections) {\n    for (const entry of section.entries) {\n      map.set(entry.id, entry)\n      if (entry.kind === 'subheading' || entry.kind === 'project-heading') {\n        for (const item of entry.items) {\n          map.set(item.id, item)\n        }\n      }\n    }\n  }\n  return map\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:55:59 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/latex/ast-types.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:56:06 PM</sup>
+
+Now the parser. Several pieces:
+1. Normalize section titles (strip `\textcolor`, `\textbf`)
+2. Recognize `\resumeSubheadingSecond` (6 args) and emit variant `'second'`
+3. Recognize `\resumeProjectHeading` (2 args) — produces `ProjectHeadingNode`
+4. Recognize `\addproject{Key}` — produces `BankedProjectNode`
+5. Update `\resumeSubheading` to set `variant: 'standard'`
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:56:08 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts",
+  "old_string": "import type {\n  ResumeAST, SectionNode, SectionType,\n  SubheadingNode, ItemNode, SkillsNode, EntryNode,\n} from './ast-types'",
+  "new_string": "import type {\n  ResumeAST, SectionNode, SectionType,\n  SubheadingNode, ItemNode, SkillsNode, EntryNode,\n  ProjectHeadingNode, BankedProjectNode,\n} from './ast-types'"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:56:09 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:56:17 PM</sup>
+
+Now add title normalization helper and update the parser logic. The section-title regex `/\\section\{([^}]+)\}/g` won't work for `\section{\textcolor{darkblue}{Education}}` because it stops at the first `}`. I need to use bracket-balanced extraction for `\section{...}`.
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:56:23 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts",
+  "old_string": "// ---------------------------------------------------------------------------\n// Section type from title\n// ---------------------------------------------------------------------------\nconst SECTION_TYPE_MAP: Record<string, SectionType> = {\n  experience: 'experience',\n  education: 'education',\n  projects: 'projects',\n  'technical skills': 'skills',\n  skills: 'skills',\n}\n\nfunction sectionType(title: string): SectionType {\n  return SECTION_TYPE_MAP[title.toLowerCase().trim()] ?? 'experience'\n}",
+  "new_string": "// ---------------------------------------------------------------------------\n// Section type from title\n// ---------------------------------------------------------------------------\nconst SECTION_TYPE_MAP: Record<string, SectionType> = {\n  experience: 'experience',\n  education: 'education',\n  projects: 'projects',\n  'technical skills': 'skills',\n  skills: 'skills',\n}\n\n/**\n * Strip wrapper commands like \\textcolor{c}{Title} or \\textbf{Title} so\n * \\section{\\textcolor{darkblue}{Education}} normalizes to \"Education\".\n * Applied repeatedly until no wrappers remain.\n */\nfunction normalizeSectionTitle(raw: string): string {\n  let out = raw.trim()\n  let changed = true\n  while (changed) {\n    changed = false\n    // \\textcolor{x}{Inner} or \\textbf{Inner} or \\emph{Inner}\n    const m = out.match(/^\\\\(?:textcolor|textbf|emph|underline)\\s*(?:\\{[^}]*\\}\\s*)?\\{(.*)\\}\\s*$/)\n    if (m) {\n      out = m[1].trim()\n      changed = true\n    }\n  }\n  return out\n}\n\nfunction sectionType(title: string): SectionType {\n  return SECTION_TYPE_MAP[normalizeSectionTitle(title).toLowerCase()] ?? 'experience'\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:56:24 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:56:32 PM</sup>
+
+Now add `\resumeSubheadingSecond`, `\resumeProjectHeading`, `\addproject` parsers, and update `parseSubheading` to set `variant: 'standard'`:
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:56:57 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts",
+  "old_string": "// ---------------------------------------------------------------------------\n// Parse \\resumeSubheading{}{}{}{} block starting at `pos`.\n// Includes all \\resumeItem children up to the next \\resumeSubheading,\n// \\resumeSubHeadingListEnd, or end of section.\n// ---------------------------------------------------------------------------\nfunction parseSubheading(\n  src: string,\n  pos: number,\n  id: string,\n  sectionEnd: number,\n): SubheadingNode | null {\n  if (!src.startsWith('\\\\resumeSubheading', pos)) return null\n  const afterMacro = pos + '\\\\resumeSubheading'.length\n  try {\n    const [args, afterArgs] = extractArgs(src, afterMacro, 4)\n\n    // Find \\resumeItemListStart (optional — some entries have no bullets)\n    const itemListStart = src.indexOf('\\\\resumeItemListStart', afterArgs)\n    const itemListEnd = src.indexOf('\\\\resumeItemListEnd', afterArgs)\n\n    // Find where this subheading block ends:\n    // either at \\resumeItemListEnd (inclusive) or at next \\resumeSubheading / section end\n    let blockEnd: number\n    if (itemListEnd !== -1 && itemListEnd < sectionEnd) {\n      blockEnd = itemListEnd + '\\\\resumeItemListEnd'.length\n    } else {\n      // no item list — block ends before next \\resumeSubheading or section end\n      const nextSub = src.indexOf('\\\\resumeSubheading', afterArgs)\n      blockEnd = nextSub !== -1 && nextSub < sectionEnd ? nextSub : sectionEnd\n    }\n\n    // Parse items\n    const items: ItemNode[] = []\n    if (itemListStart !== -1 && itemListStart < sectionEnd && itemListEnd !== -1) {\n      let cur = itemListStart + '\\\\resumeItemListStart'.length\n      let itemIdx = 0\n      while (cur < itemListEnd) {\n        // Skip whitespace\n        while (cur < itemListEnd && /\\s/.test(src[cur])) cur++\n        if (cur >= itemListEnd) break\n        const itemId = `${id}-item-$
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:56:58 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:57:05 PM</sup>
+
+Now update the main parser loop to use bracket-balanced `\section{...}` extraction (so `\section{\textcolor{darkblue}{Education}}` works) and to dispatch to the right entry parser based on which macro appears next.
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:57:21 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts",
+  "old_string": "    // ---- Find all \\section{} positions ----\n    const sectionRegex = /\\\\section\\{([^}]+)\\}/g\n    const sectionMatches: Array<{ title: string; index: number }> = []\n    let m: RegExpExecArray | null\n    while ((m = sectionRegex.exec(src)) !== null) {\n      sectionMatches.push({ title: m[1], index: m.index })\n    }\n\n    if (sectionMatches.length === 0) {\n      return { preamble, header, sections: [], parseError: 'No \\\\section{} blocks found' }\n    }\n\n    // ---- Parse each section ----\n    const sections: SectionNode[] = []\n\n    for (let si = 0; si < sectionMatches.length; si++) {\n      const { title, index: sectionStart } = sectionMatches[si]\n      const sectionEnd = si + 1 < sectionMatches.length\n        ? sectionMatches[si + 1].index\n        : src.indexOf('\\\\end{document}') !== -1\n          ? src.indexOf('\\\\end{document}')\n          : src.length\n\n      const type = sectionType(title)\n      const prefix = SECTION_PREFIX[type]\n      const entries: EntryNode[] = []\n\n      if (type === 'skills') {\n        entries.push(parseSkillsSection(src, sectionStart, sectionEnd))\n      } else {\n        // Find all \\resumeSubheading occurrences within this section\n        let searchFrom = sectionStart\n        let subIdx = 0\n        while (searchFrom < sectionEnd) {\n          const nextSub = src.indexOf('\\\\resumeSubheading', searchFrom)\n          if (nextSub === -1 || nextSub >= sectionEnd) break\n\n          const id = `${prefix}-${subIdx}`\n          const node = parseSubheading(src, nextSub, id, sectionEnd)\n          if (node) {\n            entries.push(node)\n            searchFrom = node.endIndex\n            subIdx++\n          } else {\n            searchFrom = nextSub + 1\n          }\n        }\n      }\n\n      sections.push({ title, type, entries, startIndex: sectionStart, endIndex: sectionEnd
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:57:22 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:57:28 PM</sup>
+
+Add the `isCommentedAt` helper:
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:57:32 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts",
+  "old_string": "// ---------------------------------------------------------------------------\n// Common item-list parser shared by \\resumeSubheading and \\resumeProjectHeading\n// ---------------------------------------------------------------------------",
+  "new_string": "/** True if `pos` is on a line whose first non-whitespace char is `%`. */\nfunction isCommentedAt(src: string, pos: number): boolean {\n  let i = pos\n  // walk back to start of line\n  while (i > 0 && src[i - 1] !== '\\n') i--\n  // skip whitespace\n  while (i < pos && /\\s/.test(src[i])) i++\n  return src[i] === '%'\n}\n\n// ---------------------------------------------------------------------------\n// Common item-list parser shared by \\resumeSubheading and \\resumeProjectHeading\n// ---------------------------------------------------------------------------"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:57:33 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:57:40 PM</sup>
+
+Update the parser's `selfTest` to handle new node kinds:
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:57:45 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts",
+  "old_string": "    for (const entry of section.entries) {\n      if (entry.kind === 'subheading') {\n        console.log(`    [${entry.id}] \"${entry.args[0]}\" @ ${entry.startIndex}–${entry.endIndex}, items: ${entry.items.length}`)\n        for (const item of entry.items) {\n          console.log(`      [${item.id}] \"${item.text.slice(0, 60)}…\"`)\n        }\n      } else if (entry.kind === 'skills') {\n        console.log(`    [${entry.id}] skills block @ ${entry.startIndex}–${entry.endIndex}`)\n      }\n    }",
+  "new_string": "    for (const entry of section.entries) {\n      if (entry.kind === 'subheading') {\n        console.log(`    [${entry.id}] (${entry.variant}) \"${entry.args[0]}\" @ ${entry.startIndex}–${entry.endIndex}, items: ${entry.items.length}`)\n        for (const item of entry.items) console.log(`      [${item.id}] \"${item.text.slice(0, 60)}…\"`)\n      } else if (entry.kind === 'project-heading') {\n        console.log(`    [${entry.id}] (project) \"${entry.heading.slice(0, 60)}…\", items: ${entry.items.length}`)\n        for (const item of entry.items) console.log(`      [${item.id}] \"${item.text.slice(0, 60)}…\"`)\n      } else if (entry.kind === 'banked-project') {\n        console.log(`    [${entry.id}] (banked) key=\"${entry.bankKey}\"`)\n      } else if (entry.kind === 'skills') {\n        console.log(`    [${entry.id}] skills block @ ${entry.startIndex}–${entry.endIndex}`)\n      }\n    }"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:57:46 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:57:55 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts",
+  "old_string": "      if (entry.kind === 'subheading' && !slice.includes('\\\\resumeSubheading')) {\n        console.error(`  [FAIL] ${entry.id} slice doesn't contain \\\\resumeSubheading`)\n        roundTripOk = false\n      }\n      // Also verify items within subheadings\n      if (entry.kind === 'subheading') {\n        for (const item of entry.items) {",
+  "new_string": "      if (entry.kind === 'subheading' && !slice.includes('\\\\resumeSubheading')) {\n        console.error(`  [FAIL] ${entry.id} slice doesn't contain \\\\resumeSubheading`)\n        roundTripOk = false\n      }\n      if (entry.kind === 'subheading' || entry.kind === 'project-heading') {\n        for (const item of entry.items) {"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:57:56 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:58:04 PM</sup>
+
+Quick check that parser dispatches correctly on your real resume:
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:58:07 PM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "cat > /tmp/parse.mjs <<'EOF'\nimport { parseResume } from '/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts'\nimport fs from 'fs'\nconst src = fs.readFileSync('/Users/michellelu/project_folder/resume-editor/temp', 'utf8')\nconst ast = parseResume(src)\nconsole.log('parseError:', ast.parseError)\nfor (const s of ast.sections) {\n  console.log(`\\n[${s.type}] \"${s.title}\" — entries: ${s.entries.length}`)\n  for (const e of s.entries) {\n    if (e.kind === 'subheading') console.log(`  ${e.id} (${e.variant}) args=${e.args.length} items=${e.items.length} → \"${e.args[0]}\"`)\n    else if (e.kind === 'project-heading') console.log(`  ${e.id} (project) items=${e.items.length} → \"${e.heading.slice(0,60)}…\"`)\n    else if (e.kind === 'banked-project') console.log(`  ${e.id} (banked) key=\"${e.bankKey}\"`)\n    else if (e.kind === 'skills') console.log(`  ${e.id} (skills)`)\n  }\n}\nEOF\nnpx tsx /tmp/parse.mjs 2>&1 | head -60",
+  "description": "Parse Michelle's real resume"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:58:20 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+parseError: TypeError: raw.trim is not a function
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:58:32 PM</sup>
+
+Hmm — the section title isn't a string somewhere. Let me check `parseSkillsSection`. It uses `src.slice(...).trim()` — that's fine. The error is in `normalizeSectionTitle` probably called with undefined. The section macro extraction must be passing in `title` as something other than a string. Let me trace: `extractArgs(...)` returns `string[]`. Then `title = extracted[0]`. Should work... maybe `parseSkillsSection` calls something that returns `raw`. Actually the error trace shows `raw.trim is not a function`. The `raw` field is on the `SkillsNode`. Then `parseSkillCategories` calls `raw.replace`. Let me check the call site — `from-ast.ts` uses `entry.raw`. But we're just parsing here, not running from-ast.
+
+Actually `parseSkillsSection` builds `raw` via `src.slice(...).trim()` — that's a string. So that's fine.
+
+The error must be in section title parsing. Let me see — `extractArgs` for `\section{...}`: my code calls `extractArgs(src, next + '\\section'.length, 1)`. `extractArgs` skips whitespace then calls `extractArg`. `extractArg` requires `{` at pos. The title arg comes back as a string. Then `sectionMatches.push({ title, index: next })`.
+
+Then later: `sectionType(title)` → `normalizeSectionTitle(title)`. But — oh, `title` is the destructured first element of `args` array. `args` is `string[]`. So title is a string. Unless `extractArgs` returns something weird. Let me just trace with a sanity print:
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:58:34 PM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "cat > /tmp/parse2.mjs <<'EOF'\nimport { parseResume } from '/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts'\nconst src = `\\\\begin{document}\\n\\\\section{\\\\textcolor{darkblue}{Education}}\\nfoo\\n\\\\end{document}`\nconst ast = parseResume(src)\nconsole.log('parseError:', ast.parseError)\nconsole.log('sections:', ast.sections.length, ast.sections.map(s=>({title:s.title, type:s.type})))\nEOF\nnpx tsx /tmp/parse2.mjs 2>&1",
+  "description": "Minimal title test"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:58:37 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+parseError: TypeError: raw.trim is not a function
+sections: 0 []
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:58:46 PM</sup>
+
+Still failing on the minimal case. The problem must be earlier — `parseSkillsSection`? No, no skills here. Let me look at the error more carefully — it says `raw.trim is not a function`. Where is `.trim()` called on a `raw` variable? Let me check my normalizeSectionTitle: `let out = raw.trim()`. Yes! Title parameter is named `raw` in my normalize function, and somehow it's being passed something that's not a string. Let me check `sectionType` — `sectionType(title)`. If `title` is undefined, error. Let me look at my extractArgs flow more carefully:
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:58:47 PM</sup>
+
+<details>
+<summary>Tool: <code>Read</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts",
+  "offset": 220,
+  "limit": 40
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:58:47 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+220	    }
+221	  } catch { return null }
+222	}
+223	
+224	// ---------------------------------------------------------------------------
+225	// \resumeProjectHeading{heading}{dates}
+226	// ---------------------------------------------------------------------------
+227	function parseProjectHeading(
+228	  src: string,
+229	  pos: number,
+230	  id: string,
+231	  sectionEnd: number,
+232	): ProjectHeadingNode | null {
+233	  if (!src.startsWith('\\resumeProjectHeading', pos)) return null
+234	  const after = pos + '\\resumeProjectHeading'.length
+235	  try {
+236	    const [args, afterArgs] = extractArgs(src, after, 2)
+237	    const { items, blockEnd } = parseItemsBetween(src, afterArgs, id, sectionEnd)
+238	    return {
+239	      kind: 'project-heading', id,
+240	      heading: args[0], dates: args[1],
+241	      items, startIndex: pos, endIndex: blockEnd,
+242	    }
+243	  } catch { return null }
+244	}
+245	
+246	// ---------------------------------------------------------------------------
+247	// \addp
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:58:56 PM</sup>
+
+Found it: I'm destructuring `extractArgs` return value as `const [args, afterArgs] = extractArgs(...)` — but `extractArgs` returns `[string[], number]`. So `args` is correctly `string[]`. BUT in the section title code I wrote:
+
+```
+const [title] = extractArgs(src, next + '\\section'.length, 1)
+```
+
+That destructures the first element of the **tuple** return, which is the `string[]` array — not the title itself. So `title` is `['Education']`, not `'Education'`. Then `normalizeSectionTitle` calls `.trim()` on an array → "not a function". Fix:
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:58:58 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts",
+  "old_string": "        if (isCommentedAt(src, next)) { cur = next + 1; continue }\n        try {\n          const [title] = extractArgs(src, next + '\\\\section'.length, 1)\n          sectionMatches.push({ title, index: next })\n        } catch {",
+  "new_string": "        if (isCommentedAt(src, next)) { cur = next + 1; continue }\n        try {\n          const [titleArgs] = extractArgs(src, next + '\\\\section'.length, 1)\n          sectionMatches.push({ title: titleArgs[0], index: next })\n        } catch {"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:58:59 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:59:06 PM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "npx tsx /tmp/parse.mjs 2>&1 | head -40",
+  "description": "Re-parse Michelle's real resume"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:59:21 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+parseError: undefined
+
+[education] "\textcolor{darkblue}{Education}" — entries: 1
+  edu-0 (second) args=6 items=0 → "University of Waterloo"
+
+[skills] "\textcolor{darkblue}{Technical Skills}" — entries: 1
+  skills-0 (skills)
+
+[experience] "\textcolor{darkblue}{Experience}" — entries: 4
+  exp-0 (standard) args=4 items=3 → "AI Software Engineer Co-op"
+  exp-1 (standard) args=4 items=3 → "Undergraduate Research Assistant"
+  exp-2 (standard) args=4 items=3 → "Software Development Co-op"
+  exp-3 (standard) args=4 items=3 → "Software Development Co-op"
+
+[projects] "\textcolor{darkblue}{Projects}" — entries: 3
+  proj-0 (project) items=1 → "\textbf{Notion Notes Agent} $|$ \emph{TypeScript, Node.js, N…"
+  proj-1 (project) items=2 → "\href{https://github.com/albertred/Spotify-MCP}{\textbf{Spot…"
+  proj-2 (project) items=2 → "\textbf{Zoob: Semantic Zoom with AI} $|$ \emph{TypeScript, N…"
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:59:27 PM</sup>
+
+All sections recognized, education has 1 entry (variant: 'second'), experience has 4, projects has 3. Step 1 done.
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:59:32 PM</sup>
+
+<details>
+<summary>Tool: <code>TodoWrite</code></summary>
+
+```json
+{
+  "todos": [
+    {
+      "content": "Step 1: Parser fixes — title normalization + \\resumeSubheadingSecond + \\resumeProjectHeading + \\addproject",
+      "activeForm": "Implementing parser fixes (title normalization + new macros)",
+      "status": "completed"
+    },
+    {
+      "content": "Step 2: Block shape updates + read-only flags",
+      "activeForm": "Updating block shapes and adding read-only flags",
+      "status": "in_progress"
+    },
+    {
+      "content": "Step 3: Renderer updates for new macros + raw passthrough",
+      "activeForm": "Updating renderer for new macros + raw passthrough",
+      "status": "pending"
+    },
+    {
+      "content": "Step 4: Bundle Michelle's resume as default + autosave + reset",
+      "activeForm": "Bundling default resume + autosave + reset",
+      "status": "pending"
+    },
+    {
+      "content": "Step 5: Comment-importer + remove sample bank",
+      "activeForm": "Implementing comment-importer and removing sample bank",
+      "status": "pending"
+    },
+    {
+      "content": "Step 6: \\addproject + projects.tex importer + new ops",
+      "activeForm": "Implementing \\addproject + projects.tex importer",
+      "status": "pending"
+    },
+    {
+      "content": "Step 7: Prompt updates for new ops + read-only rule",
+      "activeForm": "Updating prompts for new ops + read-only",
+      "status": "pending"
+    },
+    {
+      "content": "Step 8: Bank panel UI",
+      "activeForm": "Building bank panel UI",
+      "status": "pending"
+    },
+    {
+      "content": "Final: typecheck + build",
+      "activeForm": "Running typecheck + build",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:59:32 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:59:44 PM</sup>
+
+**Step 2: Block shape updates + read-only flags.** I need to:
+1. Add `variant`, `extras` to `EducationEntryBlock`.
+2. Add `source` and `bankKey` to `ProjectEntryBlock`.
+3. Bullets get `readOnly?: boolean` + `raw?: string`.
+4. Subheading fields (role/company/location/dates/etc.) also need `readOnly` per-field semantics — but since those are usually plain text, I'll keep them as plain strings and detect read-only at bullet level. For project headings (which are highly LaTeX-rich), the heading itself is the "interesting" field — keep as `raw`.
+
+
+---
+
+## Assistant <sup>5/11/2026, 11:59:48 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/block-types.ts",
+  "old_string": "export interface BulletBlock {\n  kind: 'bullet'\n  /** Stable ID inherited from the AST, e.g. \"exp-0-item-2\" */\n  id: string\n  /** Plain text; may contain inline \\b{...} bold markers */\n  text: string\n}",
+  "new_string": "export interface BulletBlock {\n  kind: 'bullet'\n  /** Stable ID inherited from the AST, e.g. \"exp-0-item-2\" */\n  id: string\n  /**\n   * Display text. For editable bullets this is the plain-text form with\n   * inline \\b{...} bold markers. For read-only bullets this is a plain-text\n   * approximation suitable for display; the renderer emits `raw` instead.\n   */\n  text: string\n  /**\n   * True if this bullet contains inline LaTeX commands we can't safely round-\n   * trip through the block model (e.g. \\href, \\textcolor, \\faLink, \\emph).\n   * The LLM may NOT target this bullet with replace_bullet or delete_bullet.\n   */\n  readOnly?: boolean\n  /** Original LaTeX (verbatim). Present iff readOnly; used by the renderer. */\n  raw?: string\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/11/2026, 11:59:49 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/block-types.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:00:05 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/block-types.ts",
+  "old_string": "export interface EducationEntryBlock {\n  kind: 'education-entry'\n  /** \"edu-0\", \"edu-1\", … */\n  id: string\n  school: string\n  location: string\n  degree: string\n  dates: string\n  bullets: BulletBlock[]\n}\n\nexport interface ProjectEntryBlock {\n  kind: 'project-entry'\n  /** \"proj-0\", \"proj-1\", … */\n  id: string\n  name: string\n  link: string\n  description: string\n  stack: string\n  bullets: BulletBlock[]\n}",
+  "new_string": "export interface EducationEntryBlock {\n  kind: 'education-entry'\n  /** \"edu-0\", \"edu-1\", … */\n  id: string\n  /** 'standard' = 4-arg \\resumeSubheading, 'second' = 6-arg \\resumeSubheadingSecond */\n  variant: 'standard' | 'second'\n  school: string\n  location: string\n  /** For 'second' this holds the full degree line incl. cumulative average (raw, may contain LaTeX). */\n  degree: string\n  dates: string\n  /** Present only on variant 'second': the 5th + 6th args (extras label + items, raw). */\n  extras?: { label: string; items: string }\n  /** True if any structural field above contains inline LaTeX — entry is read-only to the LLM. */\n  readOnly?: boolean\n  bullets: BulletBlock[]\n}\n\nexport interface ProjectEntryBlock {\n  kind: 'project-entry'\n  /** \"proj-0\", \"proj-1\", … for inline; \"proj-bank-<Key>\" for \\addproject. */\n  id: string\n  /** 'inline' = full \\resumeProjectHeading{...} block; 'banked' = \\addproject{Key} reference. */\n  source: 'inline' | 'banked'\n  /** For 'banked': the project key referenced from projects.tex. */\n  bankKey?: string\n  /**\n   * Display name parsed best-effort from the heading. For LLM context only;\n   * the renderer emits `headingRaw` verbatim for inline projects.\n   */\n  name: string\n  /** Best-effort stack parsed from \\emph{...}; display only. */\n  stack: string\n  /** Best-effort dates (2nd arg of \\resumeProjectHeading). 
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:00:06 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/block-types.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:00:16 AM</sup>
+
+Now `from-ast.ts` — update to populate new fields, detect read-only bullets, and handle project-heading/banked-project nodes:
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:00:52 AM</sup>
+
+<details>
+<summary>Tool: <code>Write</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/from-ast.ts",
+  "content": "import type {\n  ResumeAST,\n  SectionNode,\n  SubheadingNode,\n  SkillsNode,\n  ItemNode,\n  ProjectHeadingNode,\n  BankedProjectNode,\n  EntryNode,\n} from '../latex/ast-types'\nimport type {\n  ResumeBlocks,\n  BulletBlock,\n  ExperienceEntryBlock,\n  EducationEntryBlock,\n  ProjectEntryBlock,\n  SkillsBlock,\n  SkillsCategory,\n} from './block-types'\n\n// ---------------------------------------------------------------------------\n// AST → blocks\n// ---------------------------------------------------------------------------\n\nexport function astToBlocks(ast: ResumeAST): ResumeBlocks {\n  return {\n    header: parseHeader(ast.header),\n    experience: collect(ast, 'experience').flatMap(toExperienceEntry),\n    education: collect(ast, 'education').flatMap(toEducationEntry),\n    projects: collect(ast, 'projects').flatMap(toProjectEntry),\n    skills: toSkills(collect(ast, 'skills')),\n  }\n}\n\nfunction collect(ast: ResumeAST, type: SectionNode['type']): EntryNode[] {\n  const section = ast.sections.find((s) => s.type === type)\n  return section?.entries ?? []\n}\n\n// ---------------------------------------------------------------------------\n// Header\n// ---------------------------------------------------------------------------\n\nfunction parseHeader(header: string): { name: string; contact: string } {\n  if (!header) return { name: '', contact: '' }\n  const nameMatch = header.match(/\\\\textbf\\{[^}]*?\\\\scshape\\s+([^}]+)\\}/) ??\n    header.match(/\\\\scshape\\s+([A-Z][A-Z\\s.]+?)\\}/)\n  const name = nameMatch ? nameMatch[1].trim() : ''\n  const contactRaw = header.replace(/.*?\\\\\\\\/, '').replace(/\\\\end\\{center\\}/, '')\n  const contact = contactRaw\n    .replace(/\\\\vspace\\{[^}]*\\}/g, '')\n    .replace(/\\\\small/g, '')\n    .replace(/\\\\href\\{[^}]*\\}\\{([^}]*)\\}/g, '$1')\n    .replace(/\\\\textcolor\\{[^}]*\\}\\{([^}]*)\\}/g, '$1')\
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:00:53 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/from-ast.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:01:32 AM</sup>
+
+Quick check that astToBlocks works on the real resume:
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "cat > /tmp/blocks.mjs <<'EOF'\nimport { parseResume } from '/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts'\nimport { astToBlocks } from '/Users/michellelu/project_folder/resume-editor/lib/blocks/from-ast.ts'\nimport fs from 'fs'\nconst src = fs.readFileSync('/Users/michellelu/project_folder/resume-editor/temp', 'utf8')\nconst ast = parseResume(src)\nconst b = astToBlocks(ast)\nconsole.log('header:', b.header)\nconsole.log('education:', b.education.length, b.education[0])\nconsole.log('skills cats:', b.skills?.categories.length, b.skills?.categories.map(c => c.label))\nconsole.log('experience entries:', b.experience.length)\nfor (const e of b.experience) {\n  console.log(`  ${e.id} role=\"${e.role}\" company=\"${e.company}\"`)\n  for (const bl of e.bullets) console.log(`    [${bl.id}]${bl.readOnly ? ' [RO]' : ''} ${bl.text.slice(0, 80)}`)\n}\nconsole.log('projects:', b.projects.length)\nfor (const p of b.projects) {\n  console.log(`  ${p.id} (${p.source}) name=\"${p.name}\" stack=\"${p.stack}\" bullets=${p.bullets.length}`)\n  for (const bl of p.bullets) console.log(`    [${bl.id}]${bl.readOnly ? ' [RO]' : ''} ${bl.text.slice(0, 80)}`)\n}\nEOF\nnpx tsx /tmp/blocks.mjs 2>&1 | head -50",
+  "description": "Test astToBlocks on real resume"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:01:34 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+header: {
+  name: 'MICHELLE LU',
+  contact: '\\begin{center} {437-988-6638} | \\textcolor{myblue{michelle-portfolio.app/}} | \\textcolor{myblue{michellelu547@gmail.com}} | % \\href{mailto:m235lu@uwaterloo.ca} % {\\textcolor{myblue} % {m235lu@uwaterloo.ca}} | % \\textcolor{myblue{notion.so/michelle}} | \\textcolor{myblue{linkedin.com/in/michellelu}} | \\textcolor{myblue{github.com/albertred}}'
+}
+education: 1 {
+  kind: 'education-entry',
+  id: 'edu-0',
+  variant: 'second',
+  school: 'University of Waterloo',
+  location: 'Waterloo, ON',
+  degree: 'Candidate for Bachelor of Computer Science~\\textbar~\\textbf{91.00 Cumulative Average}',
+  dates: 'Sep 2023 -- Dec 2027',
+  extras: {
+    label: 'Relevant Courses:',
+    items: 'Algorithms, Operating Systems, Introduction to Optimization (Adv)'
+  },
+  bullets: [],
+  readOnly: true
+}
+skills cats: 2 [ 'Languages', 'Frameworks/Tools' ]
+experience entries: 4
+  exp-0 role="AI Software Engineer Co-op" company="AXL: Human Potential, AI Superpowered"
+ 
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:01:54 AM</sup>
+
+Working well. Notes: arXiv-link bullet correctly flagged read-only. Header parsing isn't great but the header is non-editable anyway. The skills section drops the commented `Current Interests` line correctly. Project name extraction has a small issue with `\scriptsize{\faLink\` not being stripped — cosmetic for LLM context. Let me proceed.
+
+<details>
+<summary>Tool: <code>TodoWrite</code></summary>
+
+```json
+{
+  "todos": [
+    {
+      "content": "Step 1: Parser fixes — title normalization + \\resumeSubheadingSecond + \\resumeProjectHeading + \\addproject",
+      "activeForm": "Implementing parser fixes (title normalization + new macros)",
+      "status": "completed"
+    },
+    {
+      "content": "Step 2: Block shape updates + read-only flags",
+      "activeForm": "Updating block shapes and adding read-only flags",
+      "status": "completed"
+    },
+    {
+      "content": "Step 3: Renderer updates for new macros + raw passthrough",
+      "activeForm": "Updating renderer for new macros + raw passthrough",
+      "status": "in_progress"
+    },
+    {
+      "content": "Step 4: Bundle Michelle's resume as default + autosave + reset",
+      "activeForm": "Bundling default resume + autosave + reset",
+      "status": "pending"
+    },
+    {
+      "content": "Step 5: Comment-importer + remove sample bank",
+      "activeForm": "Implementing comment-importer and removing sample bank",
+      "status": "pending"
+    },
+    {
+      "content": "Step 6: \\addproject + projects.tex importer + new ops",
+      "activeForm": "Implementing \\addproject + projects.tex importer",
+      "status": "pending"
+    },
+    {
+      "content": "Step 7: Prompt updates for new ops + read-only rule",
+      "activeForm": "Updating prompts for new ops + read-only",
+      "status": "pending"
+    },
+    {
+      "content": "Step 8: Bank panel UI",
+      "activeForm": "Building bank panel UI",
+      "status": "pending"
+    },
+    {
+      "content": "Final: typecheck + build",
+      "activeForm": "Running typecheck + build",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:01:54 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:01:58 AM</sup>
+
+**Step 3: Renderer updates.** Need to:
+1. Render education `'second'` variant.
+2. Render `\resumeProjectHeading` (use `headingRaw`).
+3. Render `\addproject{Key}` for banked projects.
+4. Render read-only bullets verbatim using `raw`.
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:02:06 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/to-latex.ts",
+  "old_string": "function renderEducationEntry(e: EducationEntryBlock): string {\n  return (\n    `    \\\\resumeSubheading\\n` +\n    `      {${escapeLatex(e.school)}}{${escapeLatex(e.location)}}\\n` +\n    `      {${escapeLatex(e.degree)}}{${escapeLatex(e.dates)}}\\n` +\n    renderBullets(e.bullets) +\n    `\\n`\n  )\n}\n\nfunction renderProjectEntry(p: ProjectEntryBlock): string {\n  return (\n    `    \\\\resumeSubheading\\n` +\n    `      {${escapeLatex(p.name)}}{${escapeLatex(p.link)}}\\n` +\n    `      {${escapeLatex(p.description)}}{${escapeLatex(p.stack)}}\\n` +\n    renderBullets(p.bullets) +\n    `\\n`\n  )\n}",
+  "new_string": "function renderEducationEntry(e: EducationEntryBlock): string {\n  if (e.variant === 'second') {\n    return (\n      `    \\\\resumeSubheadingSecond\\n` +\n      `      {${escapeLatex(e.school)}} {${escapeLatex(e.location)}}\\n` +\n      // degree often contains \\textbar / \\textbf — emit verbatim\n      `      {${e.degree}}{${escapeLatex(e.dates)}}\\n` +\n      `      {${escapeLatex(e.extras?.label ?? '')}} { ${escapeLatex(e.extras?.items ?? '')}}\\n` +\n      renderBullets(e.bullets) +\n      `\\n`\n    )\n  }\n  return (\n    `    \\\\resumeSubheading\\n` +\n    `      {${escapeLatex(e.school)}}{${escapeLatex(e.location)}}\\n` +\n    `      {${escapeLatex(e.degree)}}{${escapeLatex(e.dates)}}\\n` +\n    renderBullets(e.bullets) +\n    `\\n`\n  )\n}\n\nfunction renderProjectEntry(p: ProjectEntryBlock): string {\n  if (p.source === 'banked') {\n    return `    \\\\addproject{${p.bankKey ?? p.name}}\\n`\n  }\n  // Inline project — emit headingRaw verbatim to preserve \\href / \\emph / \\faLink\n  return (\n    `    \\\\resumeProjectHeading\\n` +\n    `          {${p.headingRaw}}{${escapeLatex(p.dates)}}\\n` +\n    renderBullets(p.bullets) +\n    `\\n`\n  )\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:02:07 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/to-latex.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:02:14 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/to-latex.ts",
+  "old_string": "function renderBullets(bullets: BulletBlock[]): string {\n  if (bullets.length === 0) return ''\n  const items = bullets\n    .map((b) => `        \\\\resumeItem{${renderBulletText(b.text)}}`)\n    .join('\\n')\n  return `      \\\\resumeItemListStart\\n${items}\\n      \\\\resumeItemListEnd\\n`\n}",
+  "new_string": "function renderBullets(bullets: BulletBlock[]): string {\n  if (bullets.length === 0) return ''\n  const items = bullets\n    .map((b) => {\n      // Read-only bullets: emit the original raw LaTeX verbatim\n      if (b.readOnly && b.raw) {\n        return `        \\\\resumeItem{${b.raw}}`\n      }\n      return `        \\\\resumeItem{${renderBulletText(b.text)}}`\n    })\n    .join('\\n')\n  return `      \\\\resumeItemListStart\\n${items}\\n      \\\\resumeItemListEnd\\n`\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:02:15 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/to-latex.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:02:23 AM</sup>
+
+Now run a round-trip on the real resume and check whether it compiles cleanly. First, parse → blocks → latex and diff:
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:02:27 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "cat > /tmp/rt.mjs <<'EOF'\nimport { parseResume } from '/Users/michellelu/project_folder/resume-editor/lib/latex/parser.ts'\nimport { astToBlocks } from '/Users/michellelu/project_folder/resume-editor/lib/blocks/from-ast.ts'\nimport { blocksToLatex } from '/Users/michellelu/project_folder/resume-editor/lib/blocks/to-latex.ts'\nimport fs from 'fs'\nconst src = fs.readFileSync('/Users/michellelu/project_folder/resume-editor/temp', 'utf8')\nconst ast = parseResume(src)\nconst blocks = astToBlocks(ast)\nconst out = blocksToLatex(blocks, src, ast)\nfs.writeFileSync('/tmp/in.tex', src)\nfs.writeFileSync('/tmp/out.tex', out)\nconsole.log('SAME?', out === src)\nconsole.log('len in/out:', src.length, out.length)\nEOF\nnpx tsx /tmp/rt.mjs 2>&1\necho \"=== DIFF (first 80 lines) ===\"\ndiff /tmp/in.tex /tmp/out.tex | head -80",
+  "description": "Round-trip diff on real resume"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:02:43 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+SAME? false
+len in/out: 20184 10131
+=== DIFF (first 80 lines) ===
+159a160
+> 
+164d164
+<     \resumeSubHeadingListEnd
+165a166,167
+>   \resumeSubHeadingListEnd
+> 
+172,175c174
+<      \textbf{Frameworks/Tools}{: React, Node.js, PyTorch, LangChain, MCP, FastAPI, Git, Linux} \\
+<      % \href{https://www.notion.so/current-21a63520178280569f22d4576f5739cb?source=copy_link}{\textbf{Current Interests}{ {\scriptsize{\faLink\ }}: Neuro AI, Building an LLM From Scratch}}%
+<      %\textbf{Developer Tools}{: Git, Docker, TravisCI, Google Cloud Platform, VS Code, Visual Studio, PyCharm, IntelliJ, Eclipse} \\%
+<      %\textbf{Libraries}{: pandas, NumPy, Matplotlib}%
+---
+>      \textbf{Frameworks/Tools}{: React, Node.js, PyTorch, LangChain, MCP, FastAPI, Git, Linux}
+182c181,182
+<       \resumeSubheading
+---
+> 
+>     \resumeSubheading
+186d185
+<         % \resumeItem{Building a \textbf{SwiftUI macOS} app exploring \textbf{novel human-AI interaction paradigms} from concept to launch on a \textbf{4-person t
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:02:52 AM</sup>
+
+Reviewing what's lost vs preserved:
+- **Comments inside the `\resumeItemListStart/End`** (the alternates Michelle keeps) — *deleted*. Expected; Step 5 will move them to the bank.
+- **Inter-entry block comments** like `% -----------Multiple Positions Heading-----------` and the commented `\resumeSubheading` blocks — *deleted*. Expected; Step 5.
+- **Commented-out skills categories** — *deleted*. Same workflow as above; could go in the bank too.
+- **Trailing-whitespace differences** (`workflow speed by 30\% }` → `workflow speed by 30\%}`) — cosmetic.
+- **Education indentation** difference (`\resumeSubHeadingListEnd` indent changed) — cosmetic.
+
+Importantly, **the new renderer correctly emits**:
+- `\resumeSubheadingSecond{}{}{}{}{}{}` for Education
+- `\resumeProjectHeading{...}{}` with full `\href`/`\emph` preserved for project headings
+- The arXiv read-only bullet `raw` is verbatim
+
+Let me confirm the read-only bullet was preserved correctly:
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:02:53 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "grep -n 'arXiv' /tmp/out.tex",
+  "description": "Check arXiv bullet preserved"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:03:12 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+198:        \resumeItem{\textbf{Second author} to \textbf{“Interpretable Pre-Release Baseball Pitch Type Anticipation from Broadcast 3D Kinematics”} \href{https://arxiv.org/abs/2603.04874}{\underline{(arXiv:2603.04874)}}, accepted to \textbf{CVPRW 2026}}
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:03:17 AM</sup>
+
+Verbatim. Now confirm typecheck and build still pass:
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:03:19 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "rm -f tsconfig.tsbuildinfo && npx tsc --noEmit 2>&1 | head -40; echo \"exit=$?\"",
+  "description": "Typecheck"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:03:21 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+lib/blocks/master-bank.ts(49,7): error TS2353: Object literal may only specify known properties, and 'link' does not exist in type 'ProjectEntryBlock'.
+exit=0
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:03:26 AM</sup>
+
+<details>
+<summary>Tool: <code>Read</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/master-bank.ts",
+  "offset": 40,
+  "limit": 25
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:03:26 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+40	        },
+41	      ],
+42	    },
+43	  ],
+44	  projects: [
+45	    {
+46	      kind: 'project-entry',
+47	      id: 'bank-proj-0',
+48	      name: 'StreamLint',
+49	      link: 'github.com/alexchen/streamlint',
+50	      description: 'Real-time log analyzer',
+51	      stack: 'Go, Kafka, ClickHouse',
+52	      bullets: [
+53	        {
+54	          kind: 'bullet',
+55	          id: 'bank-proj-0-item-0',
+56	          text: 'Built a streaming pipeline ingesting 200k log lines/sec with \\b{Kafka} and \\b{ClickHouse} for sub-second analytics',
+57	        },
+58	        {
+59	          kind: 'bullet',
+60	          id: 'bank-proj-0-item-1',
+61	          text: 'Implemented anomaly detection using a sliding-window heuristic, surfacing 3 production incidents during beta',
+62	        },
+63	      ],
+64	    },
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:03:33 AM</sup>
+
+Step 5 will delete `master-bank.ts` entirely. For now I'll update it so typecheck passes:
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:03:35 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/master-bank.ts",
+  "old_string": "  projects: [\n    {\n      kind: 'project-entry',\n      id: 'bank-proj-0',\n      name: 'StreamLint',\n      link: 'github.com/alexchen/streamlint',\n      description: 'Real-time log analyzer',\n      stack: 'Go, Kafka, ClickHouse',\n      bullets: [",
+  "new_string": "  projects: [\n    {\n      kind: 'project-entry',\n      id: 'bank-proj-0',\n      source: 'inline',\n      name: 'StreamLint',\n      headingRaw: '\\\\textbf{StreamLint} $|$ \\\\emph{Go, Kafka, ClickHouse}',\n      stack: 'Go, Kafka, ClickHouse',\n      dates: '',\n      bullets: ["
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:03:36 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/master-bank.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:03:42 AM</sup>
+
+Also, the experience entry in master-bank uses the old EducationEntry shape (no — it's an experience). Let me also check the typecheck for the rest:
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:03:42 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "npx tsc --noEmit 2>&1 | head -40; echo \"exit=$?\"",
+  "description": "Re-typecheck"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:04:39 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+exit=0
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:04:51 AM</sup>
+
+<details>
+<summary>Tool: <code>TodoWrite</code></summary>
+
+```json
+{
+  "todos": [
+    {
+      "content": "Step 1: Parser fixes — title normalization + \\resumeSubheadingSecond + \\resumeProjectHeading + \\addproject",
+      "activeForm": "Implementing parser fixes (title normalization + new macros)",
+      "status": "completed"
+    },
+    {
+      "content": "Step 2: Block shape updates + read-only flags",
+      "activeForm": "Updating block shapes and adding read-only flags",
+      "status": "completed"
+    },
+    {
+      "content": "Step 3: Renderer updates for new macros + raw passthrough",
+      "activeForm": "Updating renderer for new macros + raw passthrough",
+      "status": "completed"
+    },
+    {
+      "content": "Step 4: Bundle Michelle's resume as default + autosave + reset",
+      "activeForm": "Bundling default resume + autosave + reset",
+      "status": "in_progress"
+    },
+    {
+      "content": "Step 5: Comment-importer + remove sample bank",
+      "activeForm": "Implementing comment-importer and removing sample bank",
+      "status": "pending"
+    },
+    {
+      "content": "Step 6: \\addproject + projects.tex importer + new ops",
+      "activeForm": "Implementing \\addproject + projects.tex importer",
+      "status": "pending"
+    },
+    {
+      "content": "Step 7: Prompt updates for new ops + read-only rule",
+      "activeForm": "Updating prompts for new ops + read-only",
+      "status": "pending"
+    },
+    {
+      "content": "Step 8: Bank panel UI",
+      "activeForm": "Building bank panel UI",
+      "status": "pending"
+    },
+    {
+      "content": "Final: typecheck + build",
+      "activeForm": "Running typecheck + build",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:04:51 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:04:54 AM</sup>
+
+**Step 4: Bundle Michelle's resume + autosave + reset.** Create `michelle-resume.ts`, switch the default, add autosave + reset to the store.
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:04:57 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "cat /Users/michellelu/project_folder/resume-editor/temp | node -e \"let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const esc=d.replace(/\\\\\\\\/g,'\\\\\\\\\\\\\\\\').replace(/\\`/g,'\\\\\\\\\\`').replace(/\\\\\\$/g,'\\\\\\\\\\$');process.stdout.write('export const michelleResume = \\`'+esc+'\\`\\n')})\" > /Users/michellelu/project_folder/resume-editor/lib/templates/michelle-resume.ts\nwc -l /Users/michellelu/project_folder/resume-editor/lib/templates/michelle-resume.ts",
+  "description": "Generate michelle-resume.ts from temp file"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:31:38 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+353 /Users/michellelu/project_folder/resume-editor/lib/templates/michelle-resume.ts
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:31:41 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "head -5 /Users/michellelu/project_folder/resume-editor/lib/templates/michelle-resume.ts; echo \"---\"; tail -5 /Users/michellelu/project_folder/resume-editor/lib/templates/michelle-resume.ts",
+  "description": "Sanity check generated file"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:31:41 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+export const michelleResume = `%-------------------------
+% Resume in Latex
+% Author 
+% Based off of: 
+% License : MIT
+---
+
+
+%-------------------------------------------
+\\end{document}
+`
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:31:46 AM</sup>
+
+Now update the store to add autosave + reset, default to `michelleResume`:
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:31:54 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "import { create } from 'zustand'\nimport type { ResumeAST } from '../latex/ast-types'\nimport { parseResume } from '../latex/parser'\nimport type { ResumeBlocks } from '../blocks/block-types'\nimport { astToBlocks } from '../blocks/from-ast'\nimport { blocksToLatex } from '../blocks/to-latex'\nimport type { BankBlocks } from '../blocks/bank-types'\nimport { masterBank } from '../blocks/master-bank'\nimport type {\n  BlockEditOperation,\n  BlockValidationResult,\n} from '../blocks/block-edit-types'\nimport { applyBlockOp } from '../blocks/block-applicator'\n\nexport type { BlockEditOperation }",
+  "new_string": "import { create } from 'zustand'\nimport type { ResumeAST } from '../latex/ast-types'\nimport { parseResume } from '../latex/parser'\nimport type { ResumeBlocks } from '../blocks/block-types'\nimport { astToBlocks } from '../blocks/from-ast'\nimport { blocksToLatex } from '../blocks/to-latex'\nimport type { BankBlocks } from '../blocks/bank-types'\nimport { masterBank } from '../blocks/master-bank'\nimport { michelleResume } from '../templates/michelle-resume'\nimport type {\n  BlockEditOperation,\n  BlockValidationResult,\n} from '../blocks/block-edit-types'\nimport { applyBlockOp } from '../blocks/block-applicator'\n\nexport type { BlockEditOperation }\n\nconst AUTOSAVE_KEY = 'resume-editor:autosave'\n\nfunction loadAutosave(): string | null {\n  if (typeof window === 'undefined') return null\n  try {\n    return localStorage.getItem(AUTOSAVE_KEY)\n  } catch {\n    return null\n  }\n}\n\nfunction persistAutosave(source: string) {\n  if (typeof window === 'undefined') return\n  try {\n    localStorage.setItem(AUTOSAVE_KEY, source)\n  } catch {\n    // localStorage full / disabled — silently drop\n  }\n}\n\nfunction clearAutosave() {\n  if (typeof window === 'undefined') return\n  try {\n    localStorage.removeItem(AUTOSAVE_KEY
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:31:55 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:31:59 AM</sup>
+
+Now add a debounced autosave in `setLatexSource` and a `resetToDefault` action. Looking at the current `setLatexSource`:
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:32:05 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "  setLatexSource: (source: string) => void\n  setJobDescription: (jd: string) => void\n  setPipelineStatus: (status: EditorState['pipelineStatus']) => void\n  setPendingOps: (results: BlockValidationResult[]) => void\n  setActiveAnnotationId: (id: string | null) => void\n  setEditorialBrief: (brief: string[]) => void\n  acceptOp: (opId: string) => void\n  rejectOp: (opId: string) => void\n}",
+  "new_string": "  setLatexSource: (source: string) => void\n  setJobDescription: (jd: string) => void\n  setPipelineStatus: (status: EditorState['pipelineStatus']) => void\n  setPendingOps: (results: BlockValidationResult[]) => void\n  setActiveAnnotationId: (id: string | null) => void\n  setEditorialBrief: (brief: string[]) => void\n  acceptOp: (opId: string) => void\n  rejectOp: (opId: string) => void\n  /** Discard local edits and restore the bundled default resume. */\n  resetToDefault: () => void\n}\n\n// Debounced autosave so we don't hit localStorage on every keystroke.\nlet autosaveTimer: ReturnType<typeof setTimeout> | null = null\nfunction scheduleAutosave(source: string) {\n  if (typeof window === 'undefined') return\n  if (autosaveTimer) clearTimeout(autosaveTimer)\n  autosaveTimer = setTimeout(() => persistAutosave(source), 500)\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:32:06 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:32:11 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "  setLatexSource: (source) => {\n    if (get().latexSource === source) return\n    const ast = parseResume(source)\n    const blocks = ast.parseError ? null : astToBlocks(ast)\n    set({ latexSource: source, ast, blocks })\n  },",
+  "new_string": "  setLatexSource: (source) => {\n    if (get().latexSource === source) return\n    const ast = parseResume(source)\n    const blocks = ast.parseError ? null : astToBlocks(ast)\n    set({ latexSource: source, ast, blocks })\n    scheduleAutosave(source)\n  },"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:32:12 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:32:19 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "  rejectOp: (opId) => {\n    set((state) => ({\n      pendingOps: state.pendingOps.filter((r) => r.op.id !== opId),\n    }))\n  },\n}))",
+  "new_string": "  rejectOp: (opId) => {\n    set((state) => ({\n      pendingOps: state.pendingOps.filter((r) => r.op.id !== opId),\n    }))\n  },\n\n  resetToDefault: () => {\n    clearAutosave()\n    const ast = parseResume(michelleResume)\n    const blocks = ast.parseError ? null : astToBlocks(ast)\n    set({\n      latexSource: michelleResume,\n      ast,\n      blocks,\n      pendingOps: [],\n      activeAnnotationId: null,\n      editorialBrief: [],\n    })\n  },\n}))"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:32:20 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:32:25 AM</sup>
+
+Now update `app/page.tsx` to seed from `initialResumeSource()` instead of `resumeTemplate`, and add a "Reset" toolbar button:
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:32:26 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "old_string": "import { useEditorStore } from '@/lib/store/editor-store'\nimport { resumeTemplate } from '@/lib/templates/resume-template'",
+  "new_string": "import { useEditorStore, initialResumeSource } from '@/lib/store/editor-store'"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:32:27 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:32:36 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "grep -n 'resumeTemplate' /Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "description": "Find remaining resumeTemplate refs"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:32:36 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+31:  const [externalValue, setExternalValue] = useState<string | null>(resumeTemplate)
+38:    setLatexSource(resumeTemplate)
+44:  const prevLatexRef = useRef(resumeTemplate)
+230:          initialValue={resumeTemplate}
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:32:44 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "grep -n 'resumeTemplate\\|initial' /Users/michellelu/project_folder/resume-editor/app/page.tsx | head -10",
+  "description": "Look around init paths"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:32:44 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+10:import { useEditorStore, initialResumeSource } from '@/lib/store/editor-store'
+31:  const [externalValue, setExternalValue] = useState<string | null>(resumeTemplate)
+38:    setLatexSource(resumeTemplate)
+44:  const prevLatexRef = useRef(resumeTemplate)
+230:          initialValue={resumeTemplate}
+257:      <SplitPane direction="vertical" initialSplit={50} minSize={80} left={editorPanel} right={<PDFPreview />} />
+264:      <SplitPane direction="horizontal" initialSplit={35} minSize={200} left={<JobDescriptionPanel />} right={rightPanel} />
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:32:51 AM</sup>
+
+<details>
+<summary>Tool: <code>Read</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "offset": 28,
+  "limit": 55
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:32:51 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+28	  const ast = useEditorStore((s) => s.ast)
+29	
+30	  const fileInputRef = useRef<HTMLInputElement>(null)
+31	  const [externalValue, setExternalValue] = useState<string | null>(resumeTemplate)
+32	  const [saveName, setSaveName] = useState('')
+33	  const [showSaveInput, setShowSaveInput] = useState(false)
+34	  const [popoverY, setPopoverY] = useState(0)
+35	
+36	  // Seed the store with the template on first mount
+37	  useEffect(() => {
+38	    setLatexSource(resumeTemplate)
+39	    setExternalValue(null)
+40	  // eslint-disable-next-line react-hooks/exhaustive-deps
+41	  }, [])
+42	
+43	  // Push externally-changed latexSource into editor (e.g. accepted AI ops)
+44	  const prevLatexRef = useRef(resumeTemplate)
+45	  useEffect(() => {
+46	    if (latexSource !== prevLatexRef.current) {
+47	      prevLatexRef.current = latexSource
+48	      setExternalValue(latexSource)
+49	      // Close popover if its op no longer exists
+50	      setActiveAnnotationId(null)
+51	    }
+52	  }, [latexSource, setActiveA
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:32:57 AM</sup>
+
+`initialResumeSource()` reads localStorage and can only be called client-side. To avoid SSR mismatch I'll initialize state to `''` and seed it in the effect. Then `externalValue` and `prevLatexRef` should follow the same.
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:33:02 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "old_string": "  const fileInputRef = useRef<HTMLInputElement>(null)\n  const [externalValue, setExternalValue] = useState<string | null>(resumeTemplate)\n  const [saveName, setSaveName] = useState('')\n  const [showSaveInput, setShowSaveInput] = useState(false)\n  const [popoverY, setPopoverY] = useState(0)\n\n  // Seed the store with the template on first mount\n  useEffect(() => {\n    setLatexSource(resumeTemplate)\n    setExternalValue(null)\n  // eslint-disable-next-line react-hooks/exhaustive-deps\n  }, [])\n\n  // Push externally-changed latexSource into editor (e.g. accepted AI ops)\n  const prevLatexRef = useRef(resumeTemplate)",
+  "new_string": "  const fileInputRef = useRef<HTMLInputElement>(null)\n  const [externalValue, setExternalValue] = useState<string | null>(null)\n  const [saveName, setSaveName] = useState('')\n  const [showSaveInput, setShowSaveInput] = useState(false)\n  const [popoverY, setPopoverY] = useState(0)\n\n  // Seed the store on first mount — from localStorage autosave if present,\n  // else the bundled default resume.\n  useEffect(() => {\n    const initial = initialResumeSource()\n    setLatexSource(initial)\n    setExternalValue(initial)\n  // eslint-disable-next-line react-hooks/exhaustive-deps\n  }, [])\n\n  // Push externally-changed latexSource into editor (e.g. accepted AI ops)\n  const prevLatexRef = useRef('')"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:33:03 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:33:07 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "grep -n 'resumeTemplate' /Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "description": "Find remaining"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:33:07 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+232:          initialValue={resumeTemplate}
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:33:11 AM</sup>
+
+<details>
+<summary>Tool: <code>Read</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "offset": 225,
+  "limit": 15
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:33:11 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+225	          Download
+226	        </ToolbarButton>
+227	      </div>
+228	
+229	      {/* Editor + popover container */}
+230	      <div ref={editorWrapperRef} className="flex-1 min-h-0 relative">
+231	        <LaTeXEditor
+232	          initialValue={resumeTemplate}
+233	          externalValue={externalValue}
+234	          onChange={(v) => { prevLatexRef.current = v; setLatexSource(v) }}
+235	          annotations={annotations}
+236	          activeAnnotationId={activeAnnotationId}
+237	          onAnnotationClick={(id, y) => {
+238	            if (id === activeAnnotationId) { setActiveAnnotationId(null); return }
+239	            setPopoverY(y)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:33:16 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "old_string": "          initialValue={resumeTemplate}",
+  "new_string": "          initialValue=\"\""
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:33:17 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:33:25 AM</sup>
+
+Now add a "Reset" toolbar button. Let me see where toolbar buttons live:
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:33:26 AM</sup>
+
+<details>
+<summary>Tool: <code>Read</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "offset": 195,
+  "limit": 35
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:33:26 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+195	        {savedResumes.length > 0 && (
+196	          <select
+197	            onChange={(e) => { if (e.target.value) { deleteResume(e.target.value); e.target.value = '' } }}
+198	            value=""
+199	            className="text-xs rounded px-1.5 flex-shrink-0"
+200	            style={{ height: 24, border: `1px solid ${colors.border}`, backgroundColor: colors.panelBg, color: colors.mutedText }}
+201	          >
+202	            <option value="" disabled>Delete…</option>
+203	            {savedResumes.map((r) => (
+204	              <option key={r.id} value={r.id}>{r.name}</option>
+205	            ))}
+206	          </select>
+207	        )}
+208	
+209	        <div className="flex-1" />
+210	
+211	        {/* Upload / Download */}
+212	        <input ref={fileInputRef} type="file" accept=".tex,.txt" className="hidden" onChange={handleUpload} />
+213	        <ToolbarButton onClick={() => fileInputRef.current?.click()} title="Upload .tex file">
+214	          <svg width="13" height="13" viewBox="0 
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:33:33 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "old_string": "  function handleDownload() {\n    const blob = new Blob([latexSource], { type: 'text/plain' })\n    const url = URL.createObjectURL(blob)\n    const a = document.createElement('a')\n    a.href = url\n    a.download = 'resume.tex'\n    a.click()\n    URL.revokeObjectURL(url)\n  }",
+  "new_string": "  function handleDownload() {\n    const blob = new Blob([latexSource], { type: 'text/plain' })\n    const url = URL.createObjectURL(blob)\n    const a = document.createElement('a')\n    a.href = url\n    a.download = 'resume.tex'\n    a.click()\n    URL.revokeObjectURL(url)\n  }\n\n  const resetToDefault = useEditorStore((s) => s.resetToDefault)\n  function handleReset() {\n    if (!confirm('Discard your local edits and restore the bundled default resume?')) return\n    resetToDefault()\n    // Force editor to re-mount with the reset value\n    setExternalValue(null)\n    setTimeout(() => setExternalValue(useEditorStore.getState().latexSource), 0)\n    prevLatexRef.current = useEditorStore.getState().latexSource\n  }"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:33:34 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:33:47 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "old_string": "        <ToolbarButton onClick={handleDownload} title=\"Download as .tex\">\n          <svg width=\"13\" height=\"13\" viewBox=\"0 0 13 13\" fill=\"none\">\n            <path d=\"M6.5 4.5v6M6.5 10.5L4 8M6.5 10.5L9 8\" stroke=\"currentColor\" strokeWidth=\"1.3\" strokeLinecap=\"round\" strokeLinejoin=\"round\"/>\n            <path d=\"M2 2.5h9\" stroke=\"currentColor\" strokeWidth=\"1.3\" strokeLinecap=\"round\"/>\n          </svg>\n          Download\n        </ToolbarButton>\n      </div>",
+  "new_string": "        <ToolbarButton onClick={handleDownload} title=\"Download as .tex\">\n          <svg width=\"13\" height=\"13\" viewBox=\"0 0 13 13\" fill=\"none\">\n            <path d=\"M6.5 4.5v6M6.5 10.5L4 8M6.5 10.5L9 8\" stroke=\"currentColor\" strokeWidth=\"1.3\" strokeLinecap=\"round\" strokeLinejoin=\"round\"/>\n            <path d=\"M2 2.5h9\" stroke=\"currentColor\" strokeWidth=\"1.3\" strokeLinecap=\"round\"/>\n          </svg>\n          Download\n        </ToolbarButton>\n        <ToolbarButton onClick={handleReset} title=\"Discard edits, restore default resume\">\n          Reset\n        </ToolbarButton>\n      </div>"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 12:33:48 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:33:53 AM</sup>
+
+Let me verify build/typecheck still passes:
+
+
+---
+
+## Assistant <sup>5/12/2026, 12:33:54 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "npx tsc --noEmit 2>&1 | head -30; echo \"exit=$?\"",
+  "description": "Typecheck after Step 4"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:07:23 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+exit=0
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:07:35 AM</sup>
+
+<details>
+<summary>Tool: <code>TodoWrite</code></summary>
+
+```json
+{
+  "todos": [
+    {
+      "content": "Step 1: Parser fixes — title normalization + \\resumeSubheadingSecond + \\resumeProjectHeading + \\addproject",
+      "activeForm": "Implementing parser fixes (title normalization + new macros)",
+      "status": "completed"
+    },
+    {
+      "content": "Step 2: Block shape updates + read-only flags",
+      "activeForm": "Updating block shapes and adding read-only flags",
+      "status": "completed"
+    },
+    {
+      "content": "Step 3: Renderer updates for new macros + raw passthrough",
+      "activeForm": "Updating renderer for new macros + raw passthrough",
+      "status": "completed"
+    },
+    {
+      "content": "Step 4: Bundle Michelle's resume as default + autosave + reset",
+      "activeForm": "Bundling default resume + autosave + reset",
+      "status": "completed"
+    },
+    {
+      "content": "Step 5: Comment-importer + remove sample bank",
+      "activeForm": "Implementing comment-importer and removing sample bank",
+      "status": "in_progress"
+    },
+    {
+      "content": "Step 6: \\addproject + projects.tex importer + new ops",
+      "activeForm": "Implementing \\addproject + projects.tex importer",
+      "status": "pending"
+    },
+    {
+      "content": "Step 7: Prompt updates for new ops + read-only rule",
+      "activeForm": "Updating prompts for new ops + read-only",
+      "status": "pending"
+    },
+    {
+      "content": "Step 8: Bank panel UI",
+      "activeForm": "Building bank panel UI",
+      "status": "pending"
+    },
+    {
+      "content": "Final: typecheck + build",
+      "activeForm": "Running typecheck + build",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:07:35 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:07:44 AM</sup>
+
+**Step 5: Comment-importer + remove sample bank.** Strategy:
+
+1. Write `lib/blocks/import-from-comments.ts` that:
+   - Finds blocks of commented lines starting with `% ` and containing `\resumeSubheading` or `\resumeProjectHeading`
+   - Strips the `% ` prefix from each line in such a block
+   - Parses the un-commented block as a mini-source through `parseResume`
+   - Maps the resulting entries to `BankBlocks` (with `bank-` prefixed IDs)
+   - Returns the new bank AND a "stripped" version of the source with those commented blocks removed
+2. Add a button to run this once
+3. Replace `master-bank.ts` with an empty bank + persist bank in `localStorage`
+
+The implementation is tricky because the commented blocks span multiple lines including `\resumeItemListStart/End`. I'll do this: collect contiguous runs of `%`-prefixed lines, un-comment each, then try to parse each run as a standalone snippet by wrapping in a minimal section scaffolding.
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:01 AM</sup>
+
+<details>
+<summary>Tool: <code>Write</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/import-from-comments.ts",
+  "content": "import { parseResume } from '../latex/parser'\nimport { astToBlocks } from './from-ast'\nimport type { BankBlocks } from './bank-types'\nimport type { ExperienceEntryBlock, ProjectEntryBlock, BulletBlock } from './block-types'\n\n// ---------------------------------------------------------------------------\n// Importer for commented-out alternates.\n//\n// Michelle keeps backup experiences/projects in her resume as `% \\resumeSubheading{…}`\n// blocks. This module finds those blocks, un-comments them, parses them into\n// real entries, maps them to the bank's namespace, and produces a \"stripped\"\n// version of the source with the commented blocks removed.\n//\n// Usage:\n//   const { bank, strippedSource } = importFromComments(latexSource, existingBank)\n//   editorStore.setLatexSource(strippedSource)\n//   editorStore.setBank(bank)\n// ---------------------------------------------------------------------------\n\nexport interface ImportResult {\n  /** The merged bank (existing entries preserved, new ones appended). */\n  bank: BankBlocks\n  /** Source with the commented blocks removed. */\n  strippedSource: string\n  /** How many entries were imported, by kind. */\n  imported: { experience: number; projects: number }\n}\n\nconst ENTRY_MACROS = [\n  '\\\\resumeSubheading',\n  '\\\\resumeSubheadingSecond',\n  '\\\\resumeProjectHeading',\n]\n\n/**\n * Walk the source line-by-line collecting contiguous runs of `%`-prefixed\n * lines. For each run that contains one of the entry macros, un-comment and\n * try to parse. Lines inside a run that originally started with `%` are\n * stripped; the run is removed from the output source on success.\n */\nexport function importFromComments(\n  source: string,\n  existingBank: BankBlocks,\n): ImportResult {\n  const lines = source.split('\\n')\n  const importedExperience: ExperienceEntryBlock[] = []\n  const impor
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:08:02 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+File created successfully at: /Users/michellelu/project_folder/resume-editor/lib/blocks/import-from-comments.ts (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:06 AM</sup>
+
+Now replace `master-bank.ts` with an empty bank and add localStorage persistence in the store:
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:09 AM</sup>
+
+<details>
+<summary>Tool: <code>Write</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/master-bank.ts",
+  "content": "import type { BankBlocks } from './bank-types'\n\n// ---------------------------------------------------------------------------\n// Empty default bank. Real bank content is built up at runtime by:\n//   - importFromComments() — pulls alternates from a resume's commented blocks\n//   - importProjectsTex()  — pulls projects from a \\input{projects.tex} file\n// The store persists the resulting bank in localStorage.\n// ---------------------------------------------------------------------------\n\nexport const masterBank: BankBlocks = {\n  experience: [],\n  projects: [],\n  skills: [],\n}\n"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:08:10 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/master-bank.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:15 AM</sup>
+
+Now add bank persistence + `importAlternates` action to the store:
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:17 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "import { masterBank } from '../blocks/master-bank'\nimport { michelleResume } from '../templates/michelle-resume'",
+  "new_string": "import { masterBank } from '../blocks/master-bank'\nimport { importFromComments } from '../blocks/import-from-comments'\nimport { michelleResume } from '../templates/michelle-resume'"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:08:18 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:25 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "const AUTOSAVE_KEY = 'resume-editor:autosave'",
+  "new_string": "const AUTOSAVE_KEY = 'resume-editor:autosave'\nconst BANK_KEY = 'resume-editor:bank'\n\nfunction loadBank(): BankBlocks {\n  if (typeof window === 'undefined') return masterBank\n  try {\n    const raw = localStorage.getItem(BANK_KEY)\n    if (!raw) return masterBank\n    return JSON.parse(raw) as BankBlocks\n  } catch {\n    return masterBank\n  }\n}\n\nfunction persistBank(bank: BankBlocks) {\n  if (typeof window === 'undefined') return\n  try {\n    localStorage.setItem(BANK_KEY, JSON.stringify(bank))\n  } catch {\n    // ignore\n  }\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:08:26 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:32 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "  acceptOp: (opId: string) => void\n  rejectOp: (opId: string) => void\n  /** Discard local edits and restore the bundled default resume. */\n  resetToDefault: () => void\n}",
+  "new_string": "  acceptOp: (opId: string) => void\n  rejectOp: (opId: string) => void\n  /** Discard local edits and restore the bundled default resume. */\n  resetToDefault: () => void\n  /** Replace the bank entirely (persists to localStorage). */\n  setBank: (bank: BankBlocks) => void\n  /**\n   * Scan the current resume for commented-out alternate entries, move them\n   * into the bank, and strip them from the source. Returns counts.\n   */\n  importAlternates: () => { experience: number; projects: number }\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:08:33 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:37 AM</sup>
+
+Now replace the `bank: masterBank` initial value and add the new actions:
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:38 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "  bank: masterBank,",
+  "new_string": "  bank: loadBank(),"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:08:39 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:49 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "  resetToDefault: () => {\n    clearAutosave()\n    const ast = parseResume(michelleResume)\n    const blocks = ast.parseError ? null : astToBlocks(ast)\n    set({\n      latexSource: michelleResume,\n      ast,\n      blocks,\n      pendingOps: [],\n      activeAnnotationId: null,\n      editorialBrief: [],\n    })\n  },\n}))",
+  "new_string": "  resetToDefault: () => {\n    clearAutosave()\n    const ast = parseResume(michelleResume)\n    const blocks = ast.parseError ? null : astToBlocks(ast)\n    set({\n      latexSource: michelleResume,\n      ast,\n      blocks,\n      pendingOps: [],\n      activeAnnotationId: null,\n      editorialBrief: [],\n    })\n  },\n\n  setBank: (bank) => {\n    persistBank(bank)\n    set({ bank })\n  },\n\n  importAlternates: () => {\n    const { latexSource, bank } = get()\n    const { bank: newBank, strippedSource, imported } = importFromComments(latexSource, bank)\n    persistBank(newBank)\n    const ast = parseResume(strippedSource)\n    const blocks = ast.parseError ? null : astToBlocks(ast)\n    set({ bank: newBank, latexSource: strippedSource, ast, blocks })\n    scheduleAutosave(strippedSource)\n    return imported\n  },\n}))"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:08:50 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:54 AM</sup>
+
+Quick test of the importer on the real resume:
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:08:57 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "cat > /tmp/imp.mjs <<'EOF'\nimport { importFromComments } from '/Users/michellelu/project_folder/resume-editor/lib/blocks/import-from-comments.ts'\nimport fs from 'fs'\nconst src = fs.readFileSync('/Users/michellelu/project_folder/resume-editor/temp', 'utf8')\nconst empty = { experience: [], projects: [], skills: [] }\nconst result = importFromComments(src, empty)\nconsole.log('imported:', result.imported)\nconsole.log('bank.experience:')\nfor (const e of result.bank.experience) {\n  console.log(`  ${e.id} role=\"${e.role}\" company=\"${e.company}\" bullets=${e.bullets.length}`)\n}\nconsole.log('bank.projects:')\nfor (const p of result.bank.projects) {\n  console.log(`  ${p.id} name=\"${p.name}\" bullets=${p.bullets.length}`)\n}\nconsole.log('source delta:', src.length - result.strippedSource.length, 'chars removed')\nEOF\nnpx tsx /tmp/imp.mjs 2>&1 | head -30",
+  "description": "Test importer on real resume"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:17:53 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+imported: { experience: 1, projects: 11 }
+bank.experience:
+  bank-exp-0 role="\href{https://github.com/sherryliu-lsy/BLOB}{Undergraduate Researcher, UR2PhD Program \scriptsize{\faLink\ }}" company="University of Waterloo" bullets=3
+bank.projects:
+  bank-proj-0 name="Muse - Poetry Sharing Site \scriptsize{\faLink\" bullets=2
+  bank-proj-1 name="Ray Tracer" bullets=2
+  bank-proj-2 name="WLP4 Compiler" bullets=2
+  bank-proj-3 name="Research Project, UR2PhD" bullets=2
+  bank-proj-4 name="Watan, CS246 Final Project" bullets=2
+  bank-proj-5 name="Events Coordinator, WiSTEM" bullets=2
+  bank-proj-6 name="Mingo, Hack the North \scriptsize{\faLink\" bullets=2
+  bank-proj-7 name="FridgeFriend, Technova Best UI/UX Winner \scriptsize{\faLink\" bullets=2
+  bank-proj-8 name="Payroll Management Software \scriptsize{\faLink\" bullets=2
+  bank-proj-9 name="Mingo, Hack the North \scriptsize{\faLink\" bullets=2
+  bank-proj-10 name="FridgeFriend, Technova Best UI/UX Winner \scriptsize{\faLink\" bullets=2
+
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:17:59 AM</sup>
+
+Importer works — 1 experience + 11 projects extracted, ~7400 chars stripped. Some projects have `\scriptsize{\faLink\` artifacts in the name but the bullets are intact, which is the important part. Type/build check:
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:17:59 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "npx tsc --noEmit 2>&1 | head -20; echo \"exit=$?\"",
+  "description": "Typecheck after Step 5"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:18:04 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+exit=0
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:18:13 AM</sup>
+
+<details>
+<summary>Tool: <code>TodoWrite</code></summary>
+
+```json
+{
+  "todos": [
+    {
+      "content": "Step 1: Parser fixes — title normalization + \\resumeSubheadingSecond + \\resumeProjectHeading + \\addproject",
+      "activeForm": "Implementing parser fixes (title normalization + new macros)",
+      "status": "completed"
+    },
+    {
+      "content": "Step 2: Block shape updates + read-only flags",
+      "activeForm": "Updating block shapes and adding read-only flags",
+      "status": "completed"
+    },
+    {
+      "content": "Step 3: Renderer updates for new macros + raw passthrough",
+      "activeForm": "Updating renderer for new macros + raw passthrough",
+      "status": "completed"
+    },
+    {
+      "content": "Step 4: Bundle Michelle's resume as default + autosave + reset",
+      "activeForm": "Bundling default resume + autosave + reset",
+      "status": "completed"
+    },
+    {
+      "content": "Step 5: Comment-importer + remove sample bank",
+      "activeForm": "Implementing comment-importer and removing sample bank",
+      "status": "completed"
+    },
+    {
+      "content": "Step 6: \\addproject + projects.tex importer + new ops",
+      "activeForm": "Implementing \\addproject + projects.tex importer",
+      "status": "in_progress"
+    },
+    {
+      "content": "Step 7: Prompt updates for new ops + read-only rule",
+      "activeForm": "Updating prompts for new ops + read-only",
+      "status": "pending"
+    },
+    {
+      "content": "Step 8: Bank panel UI",
+      "activeForm": "Building bank panel UI",
+      "status": "pending"
+    },
+    {
+      "content": "Final: typecheck + build",
+      "activeForm": "Running typecheck + build",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:18:13 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:18:19 AM</sup>
+
+**Step 6: `\addproject` + projects.tex importer + new ops.**
+
+Plan:
+1. Parser already handles `\addproject{}` (Step 1).
+2. `from-ast.ts` already handles `BankedProjectNode` (Step 2).
+3. Renderer already emits `\addproject{}` (Step 3).
+4. Add `lib/blocks/project-bank.ts` to parse `projects.tex` (a file of `\newcommand{\ProjectKey}{...}` definitions).
+5. Add new ops `add_project_from_bank` and `remove_banked_project` to `block-edit-types.ts`.
+6. Add applicator + validator handling.
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:18:30 AM</sup>
+
+<details>
+<summary>Tool: <code>Write</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/project-bank.ts",
+  "content": "import { parseResume } from '../latex/parser'\nimport { astToBlocks } from './from-ast'\nimport type { BankBlocks } from './bank-types'\nimport type { ProjectEntryBlock, BulletBlock } from './block-types'\n\n// ---------------------------------------------------------------------------\n// projects.tex importer\n//\n// `projects.tex` is a file of \\newcommand{\\ProjectKey}{...} definitions, each\n// wrapping a \\resumeProjectHeading{}{} block and its bullets. The user's\n// active resume references these via \\addproject{Key}.\n//\n// This importer parses each \\newcommand and turns it into a bank project,\n// keyed by the project key (so \\addproject{Key} → bank-proj-bank-<Key>).\n// ---------------------------------------------------------------------------\n\nexport interface ProjectsTexImportResult {\n  bank: BankBlocks\n  imported: number\n}\n\nexport function importProjectsTex(\n  projectsTexSource: string,\n  existingBank: BankBlocks,\n): ProjectsTexImportResult {\n  const defs = extractProjectDefinitions(projectsTexSource)\n  const added: ProjectEntryBlock[] = []\n  for (const { key, body } of defs) {\n    const project = projectFromDefinition(key, body)\n    if (project) added.push(project)\n  }\n\n  // De-dupe by id (so re-import is idempotent)\n  const existingIds = new Set(existingBank.projects.map((p) => p.id))\n  const newProjects = added.filter((p) => !existingIds.has(p.id))\n\n  return {\n    bank: {\n      experience: existingBank.experience,\n      projects: [...existingBank.projects, ...newProjects],\n      skills: existingBank.skills,\n    },\n    imported: newProjects.length,\n  }\n}\n\n// ---------------------------------------------------------------------------\n// Find each \\newcommand{\\Project<Key>}{ … balanced body … }\n// ---------------------------------------------------------------------------\nfunction extractProjectDefinition
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:18:31 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+File created successfully at: /Users/michellelu/project_folder/resume-editor/lib/blocks/project-bank.ts (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:18:35 AM</sup>
+
+Now add new op types and handle them in the validator + applicator:
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:18:39 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/block-edit-types.ts",
+  "old_string": "export interface AddSkillFromBankOp {\n  id: string\n  type: 'add_skill_from_bank'\n  /** Existing category on the resume. */\n  categoryLabel: string\n  /** Items pulled from the bank's matching category. */\n  bankItems: string[]\n  rationale: string\n}",
+  "new_string": "export interface AddSkillFromBankOp {\n  id: string\n  type: 'add_skill_from_bank'\n  /** Existing category on the resume. */\n  categoryLabel: string\n  /** Items pulled from the bank's matching category. */\n  bankItems: string[]\n  rationale: string\n}\n\n/** Insert an \\addproject{Key} line referencing a project from projects.tex. */\nexport interface AddProjectFromBankOp {\n  id: string\n  type: 'add_project_from_bank'\n  /** Project key, must exist in the bank as id \"proj-bank-<bankKey>\". */\n  bankKey: string\n  /** Insertion index within the projects section; omit to append. */\n  position?: number\n  rationale: string\n}\n\n/** Remove an \\addproject{Key} line currently on the resume. */\nexport interface RemoveBankedProjectOp {\n  id: string\n  type: 'remove_banked_project'\n  /** ID of the banked project on the resume, e.g. \"proj-bank-<Key>\" */\n  targetId: string\n  rationale: string\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:18:40 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/block-edit-types.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:18:46 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/block-edit-types.ts",
+  "old_string": "export type BlockEditOperation =\n  | ReplaceBulletOp\n  | InsertBulletOp\n  | DeleteBulletOp\n  | EditSkillsOp\n  | AddBulletFromBankOp\n  | AddEntryFromBankOp\n  | AddSkillFromBankOp",
+  "new_string": "export type BlockEditOperation =\n  | ReplaceBulletOp\n  | InsertBulletOp\n  | DeleteBulletOp\n  | EditSkillsOp\n  | AddBulletFromBankOp\n  | AddEntryFromBankOp\n  | AddSkillFromBankOp\n  | AddProjectFromBankOp\n  | RemoveBankedProjectOp"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:18:47 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/block-edit-types.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:18:52 AM</sup>
+
+Update validator + applicator. Also need read-only enforcement for `replace_bullet` / `delete_bullet`:
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:18:59 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/block-validator.ts",
+  "old_string": "      case 'replace_bullet': {\n        const node = blockMap.get(op.targetId)\n        if (!node) return fail(op, `targetId \"${op.targetId}\" not found on resume`)\n        if (node.kind !== 'bullet') return fail(op, `targetId \"${op.targetId}\" is not a bullet`)\n        if (op.targetId.startsWith('bank-')) return fail(op, 'replace_bullet cannot target bank IDs')\n        return checkBulletText(op, op.text)\n      }\n\n      case 'insert_bullet': {\n        const node = blockMap.get(op.afterId)\n        if (!node) return fail(op, `afterId \"${op.afterId}\" not found on resume`)\n        if (node.kind === 'skills') return fail(op, 'Cannot insert a bullet into the skills section')\n        if (op.afterId.startsWith('bank-')) return fail(op, 'afterId cannot reference a bank ID')\n        return checkBulletText(op, op.text)\n      }\n\n      case 'delete_bullet': {\n        const node = blockMap.get(op.targetId)\n        if (!node) return fail(op, `targetId \"${op.targetId}\" not found on resume`)\n        if (node.kind !== 'bullet') return fail(op, `targetId \"${op.targetId}\" is not a bullet`)\n        return ok(op)\n      }",
+  "new_string": "      case 'replace_bullet': {\n        const node = blockMap.get(op.targetId)\n        if (!node) return fail(op, `targetId \"${op.targetId}\" not found on resume`)\n        if (node.kind !== 'bullet') return fail(op, `targetId \"${op.targetId}\" is not a bullet`)\n        if (op.targetId.startsWith('bank-')) return fail(op, 'replace_bullet cannot target bank IDs')\n        if (node.readOnly) return fail(op, 'targetId points to a read-only bullet (contains inline LaTeX)')\n        return checkBulletText(op, op.text)\n      }\n\n      case 'insert_bullet': {\n        const node = blockMap.get(op.afterId)\n        if (!node) return fail(op, `afterId \"${op.afterId}\" not found on resume`)\n 
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:19:00 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/block-validator.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:19:08 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/block-validator.ts",
+  "old_string": "      default:\n        return { op, valid: false, error: `unknown op type \"${(op as { type?: string }).type ?? '?'}\"` }\n    }\n  })",
+  "new_string": "      case 'add_project_from_bank': {\n        const bankId = `proj-bank-${op.bankKey}`\n        const bankProject = bank.projects.find((p) => p.bankKey === op.bankKey || p.id === bankId)\n        if (!bankProject) return fail(op, `bankKey \"${op.bankKey}\" not found in project bank`)\n        // Don't duplicate: warn if already on the resume\n        const already = blocks.projects.find((p) => p.bankKey === op.bankKey)\n        if (already) return fail(op, `project \"${op.bankKey}\" is already on the resume`)\n        return ok(op)\n      }\n\n      case 'remove_banked_project': {\n        const node = blockMap.get(op.targetId)\n        if (!node) return fail(op, `targetId \"${op.targetId}\" not found on resume`)\n        if (!op.targetId.startsWith('proj-bank-')) {\n          return fail(op, 'remove_banked_project only targets \\\\addproject{} references')\n        }\n        return ok(op)\n      }\n\n      default:\n        return { op, valid: false, error: `unknown op type \"${(op as { type?: string }).type ?? '?'}\"` }\n    }\n  })"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:19:09 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/block-validator.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:19:13 AM</sup>
+
+Now applicator:
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:19:19 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/blocks/block-applicator.ts",
+  "old_string": "      case 'add_skill_from_bank':\n        addSkillFromBank(next, op.categoryLabel, op.bankItems)\n        break\n    }\n    return { newBlocks: next }\n  } catch (err) {\n    return { newBlocks: blocks, error: String(err) }\n  }\n}",
+  "new_string": "      case 'add_skill_from_bank':\n        addSkillFromBank(next, op.categoryLabel, op.bankItems)\n        break\n      case 'add_project_from_bank':\n        addProjectFromBank(next, bank, op.bankKey, op.position)\n        break\n      case 'remove_banked_project':\n        removeBankedProject(next, op.targetId)\n        break\n    }\n    return { newBlocks: next }\n  } catch (err) {\n    return { newBlocks: blocks, error: String(err) }\n  }\n}\n\nfunction addProjectFromBank(\n  blocks: ResumeBlocks,\n  bank: BankBlocks,\n  bankKey: string,\n  position: number | undefined,\n): void {\n  const bankProject = bank.projects.find((p) => p.bankKey === bankKey || p.id === `proj-bank-${bankKey}`)\n  if (!bankProject) throw new Error(`Bank project \"${bankKey}\" not found`)\n  // Emit a minimal banked stub — renderer will produce \\addproject{Key}\n  const stub: ProjectEntryBlock = {\n    kind: 'project-entry',\n    id: `proj-bank-${bankKey}`,\n    source: 'banked',\n    bankKey,\n    name: bankProject.name,\n    stack: bankProject.stack,\n    dates: '',\n    headingRaw: '',\n    bullets: [],\n  }\n  insertAt(blocks.projects, stub, position)\n}\n\nfunction removeBankedProject(blocks: ResumeBlocks, targetId: string): void {\n  const idx = blocks.projects.findIndex((p) => p.id === targetId)\n  if (idx === -1) throw new Error(`Banked project \"${targetId}\" not on resume`)\n  blocks.projects.splice(idx, 1)\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:19:20 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/blocks/block-applicator.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:19:24 AM</sup>
+
+Also add an `importProjectsTex` action to the store and a typecheck check:
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:19:25 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "import { importFromComments } from '../blocks/import-from-comments'",
+  "new_string": "import { importFromComments } from '../blocks/import-from-comments'\nimport { importProjectsTex } from '../blocks/project-bank'"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:19:26 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:19:32 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "  importAlternates: () => { experience: number; projects: number }\n}",
+  "new_string": "  importAlternates: () => { experience: number; projects: number }\n  /** Import a projects.tex file's contents into the bank. */\n  importProjectsTexSource: (source: string) => number\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:19:33 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:19:41 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts",
+  "old_string": "  importAlternates: () => {\n    const { latexSource, bank } = get()\n    const { bank: newBank, strippedSource, imported } = importFromComments(latexSource, bank)\n    persistBank(newBank)\n    const ast = parseResume(strippedSource)\n    const blocks = ast.parseError ? null : astToBlocks(ast)\n    set({ bank: newBank, latexSource: strippedSource, ast, blocks })\n    scheduleAutosave(strippedSource)\n    return imported\n  },\n}))",
+  "new_string": "  importAlternates: () => {\n    const { latexSource, bank } = get()\n    const { bank: newBank, strippedSource, imported } = importFromComments(latexSource, bank)\n    persistBank(newBank)\n    const ast = parseResume(strippedSource)\n    const blocks = ast.parseError ? null : astToBlocks(ast)\n    set({ bank: newBank, latexSource: strippedSource, ast, blocks })\n    scheduleAutosave(strippedSource)\n    return imported\n  },\n\n  importProjectsTexSource: (source) => {\n    const { bank } = get()\n    const { bank: newBank, imported } = importProjectsTex(source, bank)\n    persistBank(newBank)\n    set({ bank: newBank })\n    return imported\n  },\n}))"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:19:42 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/store/editor-store.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:19:47 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "npx tsc --noEmit 2>&1 | head -20; echo \"exit=$?\"",
+  "description": "Typecheck after Step 6"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:36:32 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+app/page.tsx(115,55): error TS2366: Function lacks ending return statement and return type does not include 'undefined'.
+components/editor/AnnotationPopover.tsx(16,7): error TS2739: Type '{ replace_bullet: { bg: string; text: string; label: string; }; insert_bullet: { bg: string; text: string; label: string; }; delete_bullet: { bg: string; text: string; label: string; }; edit_skills: { bg: string; text: string; label: string; }; add_bullet_from_bank: { ...; }; add_entry_from_bank: { ...; }; add_skill...' is missing the following properties from type 'Record<"replace_bullet" | "insert_bullet" | "delete_bullet" | "edit_skills" | "add_bullet_from_bank" | "add_entry_from_bank" | "add_skill_from_bank" | "add_project_from_bank" | "remove_banked_project", { ...; }>': add_project_from_bank, remove_banked_project
+components/editor/AnnotationPopover.tsx(26,47): error TS2366: Function lacks ending return statement and return type does not include 'undefined'.
+exit=0
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:36:38 AM</sup>
+
+Two simple fixes. Add badges for the new ops and complete the previewText switch:
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:36:41 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/components/editor/AnnotationPopover.tsx",
+  "old_string": "  add_bullet_from_bank: { bg: '#eefff4', text: '#2e7d4f', label: 'Add (bank)' },\n  add_entry_from_bank:  { bg: '#eefff4', text: '#2e7d4f', label: 'Add entry' },\n  add_skill_from_bank:  { bg: '#eef4ff', text: '#2b5fa3', label: 'Add skills' },\n}",
+  "new_string": "  add_bullet_from_bank: { bg: '#eefff4', text: '#2e7d4f', label: 'Add (bank)' },\n  add_entry_from_bank:  { bg: '#eefff4', text: '#2e7d4f', label: 'Add entry' },\n  add_skill_from_bank:  { bg: '#eef4ff', text: '#2b5fa3', label: 'Add skills' },\n  add_project_from_bank: { bg: '#eefff4', text: '#2e7d4f', label: 'Add project' },\n  remove_banked_project: { bg: '#fff0f0', text: '#c0392b', label: 'Remove project' },\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:36:42 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/components/editor/AnnotationPopover.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:36:48 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/components/editor/AnnotationPopover.tsx",
+  "old_string": "    case 'add_bullet_from_bank':\n      return `↑ from ${op.bankId}`\n    case 'add_entry_from_bank':\n      return `↑ from ${op.bankId}`\n    case 'delete_bullet':\n      return null\n  }\n}",
+  "new_string": "    case 'add_bullet_from_bank':\n      return `↑ from ${op.bankId}`\n    case 'add_entry_from_bank':\n      return `↑ from ${op.bankId}`\n    case 'add_project_from_bank':\n      return `↑ \\\\addproject{${op.bankKey}}`\n    case 'remove_banked_project':\n      return `× ${op.targetId}`\n    case 'delete_bullet':\n      return null\n  }\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:36:49 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/components/editor/AnnotationPopover.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:36:53 AM</sup>
+
+Now `app/page.tsx:115` — the `anchorIdAndKind` switch needs to handle the two new ops:
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:36:58 AM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "old_string": "    function anchorIdAndKind(op: BlockEditOperation): { anchorId: string; kind: AnnotationMarkKind } | null {\n      switch (op.type) {\n        case 'replace_bullet':       return { anchorId: op.targetId, kind: 'replace' }\n        case 'delete_bullet':        return { anchorId: op.targetId, kind: 'delete' }\n        case 'insert_bullet':        return { anchorId: op.afterId,  kind: 'insert' }\n        case 'add_bullet_from_bank': return { anchorId: op.afterId,  kind: 'insert' }\n        case 'add_entry_from_bank':  return null   // no on-resume anchor yet\n        case 'edit_skills':          return { anchorId: 'skills-0',  kind: 'skills' }\n        case 'add_skill_from_bank':  return { anchorId: 'skills-0',  kind: 'skills' }\n      }\n    }",
+  "new_string": "    function anchorIdAndKind(op: BlockEditOperation): { anchorId: string; kind: AnnotationMarkKind } | null {\n      switch (op.type) {\n        case 'replace_bullet':        return { anchorId: op.targetId, kind: 'replace' }\n        case 'delete_bullet':         return { anchorId: op.targetId, kind: 'delete' }\n        case 'insert_bullet':         return { anchorId: op.afterId,  kind: 'insert' }\n        case 'add_bullet_from_bank':  return { anchorId: op.afterId,  kind: 'insert' }\n        case 'add_entry_from_bank':   return null\n        case 'add_project_from_bank': return null\n        case 'remove_banked_project': return { anchorId: op.targetId, kind: 'delete' }\n        case 'edit_skills':           return { anchorId: 'skills-0',  kind: 'skills' }\n        case 'add_skill_from_bank':   return { anchorId: 'skills-0',  kind: 'skills' }\n      }\n    }"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 10:37:00 AM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 10:37:08 AM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "npx tsc --noEmit 2>&1 | head -20; echo \"exit=$?\"",
+  "description": "Typecheck after Step 6 again"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:43:58 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+exit=0
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:44:12 PM</sup>
+
+<details>
+<summary>Tool: <code>TodoWrite</code></summary>
+
+```json
+{
+  "todos": [
+    {
+      "content": "Step 1: Parser fixes — title normalization + \\resumeSubheadingSecond + \\resumeProjectHeading + \\addproject",
+      "activeForm": "Implementing parser fixes (title normalization + new macros)",
+      "status": "completed"
+    },
+    {
+      "content": "Step 2: Block shape updates + read-only flags",
+      "activeForm": "Updating block shapes and adding read-only flags",
+      "status": "completed"
+    },
+    {
+      "content": "Step 3: Renderer updates for new macros + raw passthrough",
+      "activeForm": "Updating renderer for new macros + raw passthrough",
+      "status": "completed"
+    },
+    {
+      "content": "Step 4: Bundle Michelle's resume as default + autosave + reset",
+      "activeForm": "Bundling default resume + autosave + reset",
+      "status": "completed"
+    },
+    {
+      "content": "Step 5: Comment-importer + remove sample bank",
+      "activeForm": "Implementing comment-importer and removing sample bank",
+      "status": "completed"
+    },
+    {
+      "content": "Step 6: \\addproject + projects.tex importer + new ops",
+      "activeForm": "Implementing \\addproject + projects.tex importer",
+      "status": "completed"
+    },
+    {
+      "content": "Step 7: Prompt updates for new ops + read-only rule",
+      "activeForm": "Updating prompts for new ops + read-only",
+      "status": "in_progress"
+    },
+    {
+      "content": "Step 8: Bank panel UI",
+      "activeForm": "Building bank panel UI",
+      "status": "pending"
+    },
+    {
+      "content": "Final: typecheck + build",
+      "activeForm": "Running typecheck + build",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:44:12 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:44:15 PM</sup>
+
+**Step 7: Prompts.** Update Stage 3 to:
+- Document the new ops (`add_project_from_bank`, `remove_banked_project`)
+- Explain `readOnly` bullets are off-limits
+- Mention bank skills include `Frameworks/Tools` etc.
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:44:29 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/ai/prompts.ts",
+  "old_string": "## Allowed op types\n\n1. \\`replace_bullet\\`     — { type, targetId, text, rationale }\n   Replace an existing on-resume bullet's text.\n2. \\`insert_bullet\\`      — { type, afterId, text, rationale }\n   Insert a brand-new bullet. \\`afterId\\` may be a bullet ID (insert after it) or an entry ID (append to end of that entry).\n3. \\`delete_bullet\\`      — { type, targetId, rationale }\n   Remove an existing on-resume bullet (e.g. a low-signal bullet that's crowding out more relevant content).\n4. \\`edit_skills\\`        — { type, categoryLabel, items: string[], rationale }\n   Replace the full item list of an existing skills category. Use to reorder or trim, not to introduce new items the candidate doesn't have.\n5. \\`add_bullet_from_bank\\` — { type, bankId, afterId, rationale }\n   Surface a bullet that exists in the BANK but isn't on the resume yet.\n6. \\`add_entry_from_bank\\`  — { type, bankId, position?: number, rationale }\n   Add a full experience or project from the bank to the resume.\n7. \\`add_skill_from_bank\\`  — { type, categoryLabel, bankItems: string[], rationale }\n   Append items from the bank's matching category into the resume's skills.\n\n## Hard rules\n\n1. \\`targetId\\` and \\`afterId\\` MUST come from RESUME IDs below.\n2. \\`bankId\\` and items in \\`bankItems\\` MUST come from BANK IDs / BANK SKILLS below.\n3. Never mix namespaces: a bank ID cannot be a target.\n4. TRUTHFULNESS: only rephrase, quantify, or surface things that already exist in the resume or the bank. Do NOT invent technologies, numbers, employers, or accomplishments.\n5. Maximum 8 operations total. Pick the highest-leverage edits.\n6. Return ONLY the JSON object, no markdown, no commentary.",
+  "new_string": "## Allowed op types\n\n1. \\`replace_bullet\\`     — { type, targetId, text, rationale }\n   Replace an existing on-resume bullet's te
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:44:30 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/ai/prompts.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:44:33 PM</sup>
+
+Now extend `collectResumeIds` and `collectBankIds` to surface read-only bullets and banked projects:
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:44:44 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/lib/ai/prompts.ts",
+  "old_string": "function collectResumeIds(blocks: ResumeBlocks): string {\n  const lines: string[] = []\n  const pushEntry = (label: string, entry: { id: string; bullets: { id: string; text: string }[] }, summary: string) => {\n    lines.push(`  ${entry.id}  (${label}) — ${summary}`)\n    for (const b of entry.bullets) {\n      lines.push(`    ${b.id}: ${truncate(stripBoldMarkers(b.text), 80)}`)\n    }\n  }\n  blocks.experience.forEach((e) =>\n    pushEntry('experience', e, `${e.role} @ ${e.company}, ${e.dates}`),\n  )\n  blocks.education.forEach((e) =>\n    pushEntry('education', e, `${e.degree} — ${e.school}`),\n  )\n  blocks.projects.forEach((p) =>\n    pushEntry('project', p, `${p.name} (${p.stack})`),\n  )\n  if (blocks.skills) lines.push(`  skills-0  (skills) — categories: ${blocks.skills.categories.map((c) => c.label).join(', ')}`)\n  return lines.join('\\n')\n}\n\nfunction collectBankIds(bank: BankBlocks): string {\n  const lines: string[] = []\n  for (const e of bank.experience) {\n    lines.push(`  ${e.id}  (experience) — ${e.role} @ ${e.company}, ${e.dates}`)\n    for (const b of e.bullets) lines.push(`    ${b.id}: ${truncate(stripBoldMarkers(b.text), 80)}`)\n  }\n  for (const p of bank.projects) {\n    lines.push(`  ${p.id}  (project) — ${p.name} (${p.stack})`)\n    for (const b of p.bullets) lines.push(`    ${b.id}: ${truncate(stripBoldMarkers(b.text), 80)}`)\n  }\n  return lines.join('\\n') || '  (bank is empty)'\n}",
+  "new_string": "function collectResumeIds(blocks: ResumeBlocks): string {\n  const lines: string[] = []\n  const pushEntry = (\n    label: string,\n    entry: { id: string; bullets: { id: string; text: string; readOnly?: boolean }[] },\n    summary: string,\n  ) => {\n    lines.push(`  ${entry.id}  (${label}) — ${summary}`)\n    for (const b of entry.bullets) {\n      const tag = b.readOnly ? '  [READ-ONLY]' : ''\n      lines.pus
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:44:45 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/lib/ai/prompts.ts has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:44:49 PM</sup>
+
+Let me finish the typecheck pass on Step 7, then address the layout request.
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:44:49 PM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "npx tsc --noEmit 2>&1 | head -20; echo \"exit=$?\"",
+  "description": "Typecheck after Step 7"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:44:52 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+exit=0
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:45:00 PM</sup>
+
+<details>
+<summary>Tool: <code>TodoWrite</code></summary>
+
+```json
+{
+  "todos": [
+    {
+      "content": "Step 1: Parser fixes — title normalization + \\resumeSubheadingSecond + \\resumeProjectHeading + \\addproject",
+      "activeForm": "Implementing parser fixes (title normalization + new macros)",
+      "status": "completed"
+    },
+    {
+      "content": "Step 2: Block shape updates + read-only flags",
+      "activeForm": "Updating block shapes and adding read-only flags",
+      "status": "completed"
+    },
+    {
+      "content": "Step 3: Renderer updates for new macros + raw passthrough",
+      "activeForm": "Updating renderer for new macros + raw passthrough",
+      "status": "completed"
+    },
+    {
+      "content": "Step 4: Bundle Michelle's resume as default + autosave + reset",
+      "activeForm": "Bundling default resume + autosave + reset",
+      "status": "completed"
+    },
+    {
+      "content": "Step 5: Comment-importer + remove sample bank",
+      "activeForm": "Implementing comment-importer and removing sample bank",
+      "status": "completed"
+    },
+    {
+      "content": "Step 6: \\addproject + projects.tex importer + new ops",
+      "activeForm": "Implementing \\addproject + projects.tex importer",
+      "status": "completed"
+    },
+    {
+      "content": "Step 7: Prompt updates for new ops + read-only rule",
+      "activeForm": "Updating prompts for new ops + read-only",
+      "status": "completed"
+    },
+    {
+      "content": "User-requested: relayout (LaTeX left, JD top-right, PDF bottom-right)",
+      "activeForm": "Relaying out panels (LaTeX left, JD top-right, PDF bottom-right)",
+      "status": "in_progress"
+    },
+    {
+      "content": "Step 8: Bank panel UI",
+      "activeForm": "Building bank panel UI",
+      "status": "pending"
+    },
+    {
+      "content": "Final: typecheck + build",
+      "activeForm": "Running typecheck + build",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:45:00 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:45:03 PM</sup>
+
+Let me look at the current layout in `app/page.tsx` to see what to swap:
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:45:04 PM</sup>
+
+<details>
+<summary>Tool: <code>Read</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "offset": 255,
+  "limit": 30
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:45:04 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+255	            setActiveAnnotationId(id)
+256	          }}
+257	        />
+258	        {activeResult && (
+259	          <AnnotationPopover
+260	            result={activeResult}
+261	            top={popoverY}
+262	            onAccept={(id) => { acceptOp(id); setActiveAnnotationId(null) }}
+263	            onReject={(id) => { rejectOp(id); setActiveAnnotationId(null) }}
+264	            onClose={() => setActiveAnnotationId(null)}
+265	          />
+266	        )}
+267	      </div>
+268	      <EditOperationList />
+269	    </div>
+270	  )
+271	
+272	  const rightPanel = (
+273	    <div className="flex flex-col h-full">
+274	      <SplitPane direction="vertical" initialSplit={50} minSize={80} left={editorPanel} right={<PDFPreview />} />
+275	    </div>
+276	  )
+277	
+278	  return (
+279	    <div className="flex flex-col h-full">
+280	      <Header />
+281	      <SplitPane direction="horizontal" initialSplit={35} minSize={200} left={<JobDescriptionPanel />} right={rightPanel} />
+282	    </div>
+283	  )
+284	}
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:45:09 PM</sup>
+
+Current layout:
+- Outer horizontal split: **left = JD panel**, **right = vertical split of editor (top) + PDFPreview (bottom)**.
+
+Requested:
+- Outer horizontal split: **left = editor**, **right = vertical split of JD (top) + PDFPreview (bottom)**.
+
+Let me check what `direction='vertical'` means in `SplitPane` to make sure top/bottom maps right:
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:45:09 PM</sup>
+
+<details>
+<summary>Tool: <code>Read</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/components/layout/SplitPane.tsx"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:45:09 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+1	'use client'
+2	
+3	import { useRef, useState, useCallback, useEffect } from 'react'
+4	import { colors } from '@/lib/ui/theme'
+5	
+6	interface SplitPaneProps {
+7	  left: React.ReactNode
+8	  right: React.ReactNode
+9	  direction?: 'horizontal' | 'vertical'
+10	  initialSplit?: number  // 0–100, percentage for first pane
+11	  minSize?: number       // minimum px for each pane
+12	}
+13	
+14	export default function SplitPane({
+15	  left,
+16	  right,
+17	  direction = 'horizontal',
+18	  initialSplit = 50,
+19	  minSize = 120,
+20	}: SplitPaneProps) {
+21	  const containerRef = useRef<HTMLDivElement>(null)
+22	  const [split, setSplit] = useState(initialSplit)
+23	  const dragging = useRef(false)
+24	
+25	  const onMouseDown = useCallback((e: React.MouseEvent) => {
+26	    e.preventDefault()
+27	    dragging.current = true
+28	    document.body.style.cursor = direction === 'horizontal' ? 'col-resize' : 'row-resize'
+29	    document.body.style.userSelect = 'none'
+30	  }, [direction])
+31	
+32	  useEffect(() => 
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:45:12 PM</sup>
+
+`direction='vertical'` stacks top/bottom — `left` is top, `right` is bottom. Now swap the panels:
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:45:15 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "old_string": "  const rightPanel = (\n    <div className=\"flex flex-col h-full\">\n      <SplitPane direction=\"vertical\" initialSplit={50} minSize={80} left={editorPanel} right={<PDFPreview />} />\n    </div>\n  )\n\n  return (\n    <div className=\"flex flex-col h-full\">\n      <Header />\n      <SplitPane direction=\"horizontal\" initialSplit={35} minSize={200} left={<JobDescriptionPanel />} right={rightPanel} />\n    </div>\n  )\n}",
+  "new_string": "  const rightPanel = (\n    <div className=\"flex flex-col h-full\">\n      <SplitPane direction=\"vertical\" initialSplit={50} minSize={80} left={<JobDescriptionPanel />} right={<PDFPreview />} />\n    </div>\n  )\n\n  return (\n    <div className=\"flex flex-col h-full\">\n      <Header />\n      <SplitPane direction=\"horizontal\" initialSplit={50} minSize={300} left={editorPanel} right={rightPanel} />\n    </div>\n  )\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:45:16 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:45:20 PM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "npx tsc --noEmit 2>&1 | head -20; echo \"exit=$?\"",
+  "description": "Typecheck after relayout"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:45:24 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+exit=0
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:45:31 PM</sup>
+
+<details>
+<summary>Tool: <code>TodoWrite</code></summary>
+
+```json
+{
+  "todos": [
+    {
+      "content": "Step 1: Parser fixes — title normalization + \\resumeSubheadingSecond + \\resumeProjectHeading + \\addproject",
+      "activeForm": "Implementing parser fixes (title normalization + new macros)",
+      "status": "completed"
+    },
+    {
+      "content": "Step 2: Block shape updates + read-only flags",
+      "activeForm": "Updating block shapes and adding read-only flags",
+      "status": "completed"
+    },
+    {
+      "content": "Step 3: Renderer updates for new macros + raw passthrough",
+      "activeForm": "Updating renderer for new macros + raw passthrough",
+      "status": "completed"
+    },
+    {
+      "content": "Step 4: Bundle Michelle's resume as default + autosave + reset",
+      "activeForm": "Bundling default resume + autosave + reset",
+      "status": "completed"
+    },
+    {
+      "content": "Step 5: Comment-importer + remove sample bank",
+      "activeForm": "Implementing comment-importer and removing sample bank",
+      "status": "completed"
+    },
+    {
+      "content": "Step 6: \\addproject + projects.tex importer + new ops",
+      "activeForm": "Implementing \\addproject + projects.tex importer",
+      "status": "completed"
+    },
+    {
+      "content": "Step 7: Prompt updates for new ops + read-only rule",
+      "activeForm": "Updating prompts for new ops + read-only",
+      "status": "completed"
+    },
+    {
+      "content": "User-requested: relayout (LaTeX left, JD top-right, PDF bottom-right)",
+      "activeForm": "Relaying out panels",
+      "status": "completed"
+    },
+    {
+      "content": "Step 8: Bank panel UI",
+      "activeForm": "Building bank panel UI",
+      "status": "in_progress"
+    },
+    {
+      "content": "Final: typecheck + build",
+      "activeForm": "Running typecheck + build",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:45:31 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:45:37 PM</sup>
+
+**Step 8: Bank panel UI.** A minimal modal/sheet with:
+- "Extract alternates from current resume" button
+- "Import projects.tex" file picker
+- List of bank items per kind (experience / projects / skills)
+- Action: insert experience/project into resume (creates the appropriate op application — or simpler: directly mutate blocks and re-render)
+- Action: remove from bank
+
+I'll keep it simple: a collapsible toolbar dropdown that opens a side panel listing bank contents and provides those actions.
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:45:37 PM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "mkdir -p /Users/michellelu/project_folder/resume-editor/components/bank",
+  "description": "Create components/bank directory"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:45:37 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+(Bash completed with no output)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:46:06 PM</sup>
+
+<details>
+<summary>Tool: <code>Write</code></summary>
+
+```json
+{
+  "file_path": "/Users/michellelu/project_folder/resume-editor/components/bank/BankPanel.tsx",
+  "content": "'use client'\n\nimport { useRef, useState } from 'react'\nimport { useEditorStore } from '@/lib/store/editor-store'\nimport { sourceHasCommentedAlternates } from '@/lib/blocks/import-from-comments'\nimport { applyBlockOp } from '@/lib/blocks/block-applicator'\nimport { blocksToLatex } from '@/lib/blocks/to-latex'\nimport { parseResume } from '@/lib/latex/parser'\nimport { astToBlocks } from '@/lib/blocks/from-ast'\nimport { colors } from '@/lib/ui/theme'\n\ninterface BankPanelProps {\n  open: boolean\n  onClose: () => void\n}\n\nexport default function BankPanel({ open, onClose }: BankPanelProps) {\n  const bank = useEditorStore((s) => s.bank)\n  const blocks = useEditorStore((s) => s.blocks)\n  const latexSource = useEditorStore((s) => s.latexSource)\n  const ast = useEditorStore((s) => s.ast)\n  const importAlternates = useEditorStore((s) => s.importAlternates)\n  const importProjectsTexSource = useEditorStore((s) => s.importProjectsTexSource)\n  const setLatexSource = useEditorStore((s) => s.setLatexSource)\n\n  const fileInputRef = useRef<HTMLInputElement>(null)\n  const [status, setStatus] = useState<string | null>(null)\n\n  const hasAlternates = sourceHasCommentedAlternates(latexSource)\n\n  function handleExtractAlternates() {\n    const { experience, projects } = importAlternates()\n    setStatus(`Imported ${experience} experience + ${projects} projects from comments.`)\n  }\n\n  function handlePickProjectsTex() { fileInputRef.current?.click() }\n\n  function handleProjectsTexFile(e: React.ChangeEvent<HTMLInputElement>) {\n    const f = e.target.files?.[0]\n    if (!f) return\n    const reader = new FileReader()\n    reader.onload = (ev) => {\n      const text = ev.target?.result\n      if (typeof text !== 'string') return\n      const n = importProjectsTexSource(text)\n      setStatus(`Imported ${n} project${n === 1 ? '' : 's'} from projects.tex.`
+...(truncated)
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:46:07 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+File created successfully at: /Users/michellelu/project_folder/resume-editor/components/bank/BankPanel.tsx (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:46:10 PM</sup>
+
+Now wire it into `app/page.tsx` — add a "Bank" toolbar button:
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:46:12 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "old_string": "import EditOperationList from '@/components/editor/EditOperationList'",
+  "new_string": "import EditOperationList from '@/components/editor/EditOperationList'\nimport BankPanel from '@/components/bank/BankPanel'"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:46:13 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:46:17 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "old_string": "  const [popoverY, setPopoverY] = useState(0)",
+  "new_string": "  const [popoverY, setPopoverY] = useState(0)\n  const [bankOpen, setBankOpen] = useState(false)"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:46:18 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:46:22 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "old_string": "        <ToolbarButton onClick={handleReset} title=\"Discard edits, restore default resume\">\n          Reset\n        </ToolbarButton>\n      </div>",
+  "new_string": "        <ToolbarButton onClick={handleReset} title=\"Discard edits, restore default resume\">\n          Reset\n        </ToolbarButton>\n        <ToolbarButton onClick={() => setBankOpen(true)} title=\"Open content bank\">\n          Bank\n        </ToolbarButton>\n      </div>"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:46:23 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:46:31 PM</sup>
+
+<details>
+<summary>Tool: <code>Edit</code></summary>
+
+```json
+{
+  "replace_all": false,
+  "file_path": "/Users/michellelu/project_folder/resume-editor/app/page.tsx",
+  "old_string": "  return (\n    <div className=\"flex flex-col h-full\">\n      <Header />\n      <SplitPane direction=\"horizontal\" initialSplit={50} minSize={300} left={editorPanel} right={rightPanel} />\n    </div>\n  )\n}",
+  "new_string": "  return (\n    <div className=\"flex flex-col h-full\">\n      <Header />\n      <SplitPane direction=\"horizontal\" initialSplit={50} minSize={300} left={editorPanel} right={rightPanel} />\n      <BankPanel open={bankOpen} onClose={() => setBankOpen(false)} />\n    </div>\n  )\n}"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:46:32 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+The file /Users/michellelu/project_folder/resume-editor/app/page.tsx has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:46:36 PM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "npx tsc --noEmit 2>&1 | head -30; echo \"exit=$?\"",
+  "description": "Typecheck after Step 8"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:48:35 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+exit=0
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:48:39 PM</sup>
+
+<details>
+<summary>Tool: <code>Bash</code></summary>
+
+```json
+{
+  "command": "rm -rf .next && npx next build 2>&1 | tail -20",
+  "description": "Full Next build"
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:50:05 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+Generating static pages (5/7) 
+ ✓ Generating static pages (7/7)
+   Finalizing page optimization ...
+   Collecting build traces ...
+
+Route (app)                              Size     First Load JS
+┌ ○ /                                    153 kB          240 kB
+├ ○ /_not-found                          873 B            88 kB
+├ ƒ /api/analyze                         0 B                0 B
+├ ƒ /api/compile                         0 B                0 B
+└ ƒ /api/generate-edits                  0 B                0 B
++ First Load JS shared by all            87.1 kB
+  ├ chunks/117-548f5431a7608b90.js       31.6 kB
+  ├ chunks/fd9d1056-88c8a1669018f964.js  53.6 kB
+  └ other shared chunks (total)          1.86 kB
+
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:50:07 PM</sup>
+
+Clean build.
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:50:11 PM</sup>
+
+<details>
+<summary>Tool: <code>TodoWrite</code></summary>
+
+```json
+{
+  "todos": [
+    {
+      "content": "Step 1: Parser fixes — title normalization + \\resumeSubheadingSecond + \\resumeProjectHeading + \\addproject",
+      "activeForm": "Implementing parser fixes (title normalization + new macros)",
+      "status": "completed"
+    },
+    {
+      "content": "Step 2: Block shape updates + read-only flags",
+      "activeForm": "Updating block shapes and adding read-only flags",
+      "status": "completed"
+    },
+    {
+      "content": "Step 3: Renderer updates for new macros + raw passthrough",
+      "activeForm": "Updating renderer for new macros + raw passthrough",
+      "status": "completed"
+    },
+    {
+      "content": "Step 4: Bundle Michelle's resume as default + autosave + reset",
+      "activeForm": "Bundling default resume + autosave + reset",
+      "status": "completed"
+    },
+    {
+      "content": "Step 5: Comment-importer + remove sample bank",
+      "activeForm": "Implementing comment-importer and removing sample bank",
+      "status": "completed"
+    },
+    {
+      "content": "Step 6: \\addproject + projects.tex importer + new ops",
+      "activeForm": "Implementing \\addproject + projects.tex importer",
+      "status": "completed"
+    },
+    {
+      "content": "Step 7: Prompt updates for new ops + read-only rule",
+      "activeForm": "Updating prompts for new ops + read-only",
+      "status": "completed"
+    },
+    {
+      "content": "User-requested: relayout (LaTeX left, JD top-right, PDF bottom-right)",
+      "activeForm": "Relaying out panels",
+      "status": "completed"
+    },
+    {
+      "content": "Step 8: Bank panel UI",
+      "activeForm": "Building bank panel UI",
+      "status": "completed"
+    },
+    {
+      "content": "Final: typecheck + build",
+      "activeForm": "Running typecheck + build",
+      "status": "completed"
+    }
+  ]
+}
+```
+
+</details>
+
+
+---
+
+## User <sup>5/12/2026, 1:50:11 PM</sup>
+
+<details>
+<summary>Tool Result</summary>
+
+```
+Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable
+```
+
+</details>
+
+
+---
+
+## Assistant <sup>5/12/2026, 1:50:30 PM</sup>
+
+All steps from the plan are implemented, plus the layout request. Typecheck and build pass clean.
+
+## What landed
+
+**Step 1 — Parser fixes** ([lib/latex/parser.ts](resume-editor/lib/latex/parser.ts), [lib/latex/ast-types.ts](resume-editor/lib/latex/ast-types.ts))
+- Section titles now bracket-balanced + normalized through `\textcolor{…}{…}` / `\textbf{…}` wrappers, so `\section{\textcolor{darkblue}{Education}}` correctly maps to type `education`.
+- New macros recognized: `\resumeSubheadingSecond` (6-arg, sets variant `'second'`), `\resumeProjectHeading` (2-arg → `ProjectHeadingNode`), `\addproject{Key}` (→ `BankedProjectNode`).
+- Verified on your real resume: 1 education entry, 4 experiences, 3 inline projects, skills section detected.
+
+**Step 2 — Block shapes** ([lib/blocks/block-types.ts](resume-editor/lib/blocks/block-types.ts), [from-ast.ts](resume-editor/lib/blocks/from-ast.ts))
+- `BulletBlock` gets `readOnly?: boolean` + `raw?: string`. Bullets containing `\href` / `\textcolor` / `\faLink` / etc. (anything other than `\textbf`) are auto-flagged read-only.
+- `EducationEntryBlock` gets `variant`, `extras`. `ProjectEntryBlock` gets `source`, `bankKey`, `headingRaw`.
+- The arXiv bullet on your resume correctly flagged read-only.
+
+**Step 3 — Renderer** ([lib/blocks/to-latex.ts](resume-editor/lib/blocks/to-latex.ts))
+- Renders `\resumeSubheadingSecond`, `\resumeProjectHeading` (with `headingRaw` verbatim so `\href`/`\emph`/`\faLink` survive), `\addproject{Key}` for banked projects.
+- Read-only bullets emit their `raw` verbatim.
+
+**Step 4 — Default + autosave + reset** ([lib/templates/michelle-resume.ts](resume-editor/lib/templates/michelle-resume.ts), [editor-store.ts](resume-editor/lib/store/editor-store.ts), [app/page.tsx](resume-editor/app/page.tsx))
+- Your resume is now the default. Edits autosave to `localStorage` (500ms debounce). New "Reset" toolbar button restores the bundled default (with confirm).
+
+**Step 5 — Comment importer + empty bank** ([lib/blocks/import-from-comments.ts](resume-editor/lib/blocks/import-from-comments.ts), [master-bank.ts](resume-editor/lib/blocks/master-bank.ts))
+- One-click "Extract commented alternates → bank". On your real resume this pulls **1 experience + 11 projects** into the bank and strips ~7400 chars of comments.
+- Bank persists to `localStorage:resume-editor:bank`. Sample seed data removed.
+
+**Step 6 — `\addproject` + projects.tex importer + new ops** ([lib/blocks/project-bank.ts](resume-editor/lib/blocks/project-bank.ts), [block-edit-types.ts](resume-editor/lib/blocks/block-edit-types.ts), validator/applicator)
+- New ops `add_project_from_bank` (emits `\addproject{Key}`) and `remove_banked_project` (removes the line).
+- Read-only bullets explicitly rejected by validator if targeted by `replace_bullet`/`delete_bullet`.
+
+**Step 7 — Prompt updates** ([lib/ai/prompts.ts](resume-editor/lib/ai/prompts.ts))
+- Stage 3 system prompt documents the two new ops, the `[READ-ONLY]` annotation on bullets, and the strengthened truthfulness rule. Resume + bank ID lists now include read-only flags and project keys.
+
+**Step 8 — Bank panel** ([components/bank/BankPanel.tsx](resume-editor/components/bank/BankPanel.tsx))
+- Slide-in right panel with "Bank" toolbar button to open it. Has: "Extract alternates" button, "Import projects.tex" file picker, scrollable list of experiences/projects/skill items, per-row Add/Remove buttons. Banked projects already on the resume are muted with "Remove" action.
+
+**Layout change** ([app/page.tsx](resume-editor/app/page.tsx))
+- Editor on left (50%), right column vertically split: JD on top, PDF preview on bottom.
+
+To migrate your real resume: load it (or click Reset to load the bundled copy), then open Bank → "Extract commented alternates." From there your alternates are one click away in the side panel.
+
+
+---
+
+## User <sup>5/12/2026, 2:08:06 PM</sup>
+
+cool! im getting some issues iwth invalid output, could you look into adding some fallback measures:
+Expand on documentation writing experience, highlighting accepted paper.
+
+Co-authored documentation and \b{academic paper} \b{accepted} at {CVPRW 2026}, focusing on real-time analytics and 3D pose technologies
+stray "{" in bullet text
 
 
 ---

@@ -121,6 +121,17 @@ function renderExperienceEntry(e: ExperienceEntryBlock): string {
 }
 
 function renderEducationEntry(e: EducationEntryBlock): string {
+  if (e.variant === 'second') {
+    return (
+      `    \\resumeSubheadingSecond\n` +
+      `      {${escapeLatex(e.school)}} {${escapeLatex(e.location)}}\n` +
+      // degree often contains \textbar / \textbf — emit verbatim
+      `      {${e.degree}}{${escapeLatex(e.dates)}}\n` +
+      `      {${escapeLatex(e.extras?.label ?? '')}} { ${escapeLatex(e.extras?.items ?? '')}}\n` +
+      renderBullets(e.bullets) +
+      `\n`
+    )
+  }
   return (
     `    \\resumeSubheading\n` +
     `      {${escapeLatex(e.school)}}{${escapeLatex(e.location)}}\n` +
@@ -131,10 +142,13 @@ function renderEducationEntry(e: EducationEntryBlock): string {
 }
 
 function renderProjectEntry(p: ProjectEntryBlock): string {
+  if (p.source === 'banked') {
+    return `    \\addproject{${p.bankKey ?? p.name}}\n`
+  }
+  // Inline project — emit headingRaw verbatim to preserve \href / \emph / \faLink
   return (
-    `    \\resumeSubheading\n` +
-    `      {${escapeLatex(p.name)}}{${escapeLatex(p.link)}}\n` +
-    `      {${escapeLatex(p.description)}}{${escapeLatex(p.stack)}}\n` +
+    `    \\resumeProjectHeading\n` +
+    `          {${p.headingRaw}}{${escapeLatex(p.dates)}}\n` +
     renderBullets(p.bullets) +
     `\n`
   )
@@ -143,7 +157,13 @@ function renderProjectEntry(p: ProjectEntryBlock): string {
 function renderBullets(bullets: BulletBlock[]): string {
   if (bullets.length === 0) return ''
   const items = bullets
-    .map((b) => `        \\resumeItem{${renderBulletText(b.text)}}`)
+    .map((b) => {
+      // Read-only bullets: emit the original raw LaTeX verbatim
+      if (b.readOnly && b.raw) {
+        return `        \\resumeItem{${b.raw}}`
+      }
+      return `        \\resumeItem{${renderBulletText(b.text)}}`
+    })
     .join('\n')
   return `      \\resumeItemListStart\n${items}\n      \\resumeItemListEnd\n`
 }

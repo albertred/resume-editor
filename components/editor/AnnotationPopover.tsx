@@ -21,6 +21,8 @@ const TYPE_BADGE: Record<BlockEditOperation['type'], { bg: string; text: string;
   add_bullet_from_bank: { bg: '#eefff4', text: '#2e7d4f', label: 'Add (bank)' },
   add_entry_from_bank:  { bg: '#eefff4', text: '#2e7d4f', label: 'Add entry' },
   add_skill_from_bank:  { bg: '#eef4ff', text: '#2b5fa3', label: 'Add skills' },
+  add_project_from_bank: { bg: '#eefff4', text: '#2e7d4f', label: 'Add project' },
+  remove_banked_project: { bg: '#fff0f0', text: '#c0392b', label: 'Remove project' },
 }
 
 function previewText(op: BlockEditOperation): string | null {
@@ -36,6 +38,10 @@ function previewText(op: BlockEditOperation): string | null {
       return `↑ from ${op.bankId}`
     case 'add_entry_from_bank':
       return `↑ from ${op.bankId}`
+    case 'add_project_from_bank':
+      return `↑ \\addproject{${op.bankKey}}`
+    case 'remove_banked_project':
+      return `× ${op.targetId}`
     case 'delete_bullet':
       return null
   }

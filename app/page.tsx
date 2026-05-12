@@ -5,10 +5,10 @@ import SplitPane from '@/components/layout/SplitPane'
 import LaTeXEditor, { type AnnotationMark, type AnnotationMarkKind } from '@/components/editor/LaTeXEditor'
 import AnnotationPopover from '@/components/editor/AnnotationPopover'
 import EditOperationList from '@/components/editor/EditOperationList'
+import BankPanel from '@/components/bank/BankPanel'
 import JobDescriptionPanel from '@/components/jd/JobDescriptionPanel'
 import PDFPreview from '@/components/preview/PDFPreview'
-import { useEditorStore } from '@/lib/store/editor-store'
-import { resumeTemplate } from '@/lib/templates/resume-template'
+import { useEditorStore, initialResumeSource } from '@/lib/store/editor-store'
 import { colors } from '@/lib/ui/theme'
 import { parseResume } from '@/lib/latex/parser'
 import { buildNodeMap } from '@/lib/latex/ast-types'
@@ -29,20 +29,23 @@ export default function Home() {
   const ast = useEditorStore((s) => s.ast)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const [externalValue, setExternalValue] = useState<string | null>(resumeTemplate)
+  const [externalValue, setExternalValue] = useState<string | null>(null)
   const [saveName, setSaveName] = useState('')
   const [showSaveInput, setShowSaveInput] = useState(false)
   const [popoverY, setPopoverY] = useState(0)
+  const [bankOpen, setBankOpen] = useState(false)
 
-  // Seed the store with the template on first mount
+  // Seed the store on first mount — from localStorage autosave if present,
+  // else the bundled default resume.
   useEffect(() => {
-    setLatexSource(resumeTemplate)
-    setExternalValue(null)
+    const initial = initialResumeSource()
+    setLatexSource(initial)
+    setExternalValue(initial)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Push externally-changed latexSource into editor (e.g. accepted AI ops)
-  const prevLatexRef = useRef(resumeTemplate)
+  const prevLatexRef = useRef('')
   useEffect(() => {
     if (latexSource !== prevLatexRef.current) {
       prevLatexRef.current = latexSource
@@ -80,6 +83,16 @@ export default function Home() {
     URL.revokeObjectURL(url)
   }
 
+  const resetToDefault = useEditorStore((s) => s.resetToDefault)
+  function handleReset() {
+    if (!confirm('Discard your local edits and restore the bundled default resume?')) return
+    resetToDefault()
+    // Force editor to re-mount with the reset value
+    setExternalValue(null)
+    setTimeout(() => setExternalValue(useEditorStore.getState().latexSource), 0)
+    prevLatexRef.current = useEditorStore.getState().latexSource
+  }
+
   function handleSelectResume(id: string) {
     const source = loadResume(id)
     if (source) pushSource(source)
@@ -103,13 +116,15 @@ export default function Home() {
 
     function anchorIdAndKind(op: BlockEditOperation): { anchorId: string; kind: AnnotationMarkKind } | null {
       switch (op.type) {
-        case 'replace_bullet':       return { anchorId: op.targetId, kind: 'replace' }
-        case 'delete_bullet':        return { anchorId: op.targetId, kind: 'delete' }
-        case 'insert_bullet':        return { anchorId: op.afterId,  kind: 'insert' }
-        case 'add_bullet_from_bank': return { anchorId: op.afterId,  kind: 'insert' }
-        case 'add_entry_from_bank':  return null   // no on-resume anchor yet
-        case 'edit_skills':          return { anchorId: 'skills-0',  kind: 'skills' }
-        case 'add_skill_from_bank':  return { anchorId: 'skills-0',  kind: 'skills' }
+        case 'replace_bullet':        return { anchorId: op.targetId, kind: 'replace' }
+        case 'delete_bullet':         return { anchorId: op.targetId, kind: 'delete' }
+        case 'insert_bullet':         return { anchorId: op.afterId,  kind: 'insert' }
+        case 'add_bullet_from_bank':  return { anchorId: op.afterId,  kind: 'insert' }
+        case 'add_entry_from_bank':   return null
+        case 'add_project_from_bank': return null
+        case 'remove_banked_project': return { anchorId: op.targetId, kind: 'delete' }
+        case 'edit_skills':           return { anchorId: 'skills-0',  kind: 'skills' }
+        case 'add_skill_from_bank':   return { anchorId: 'skills-0',  kind: 'skills' }
       }
     }
 
@@ -223,12 +238,18 @@ export default function Home() {
           </svg>
           Download
         </ToolbarButton>
+        <ToolbarButton onClick={handleReset} title="Discard edits, restore default resume">
+          Reset
+        </ToolbarButton>
+        <ToolbarButton onClick={() => setBankOpen(true)} title="Open content bank">
+          Bank
+        </ToolbarButton>
       </div>
 
       {/* Editor + popover container */}
       <div ref={editorWrapperRef} className="flex-1 min-h-0 relative">
         <LaTeXEditor
-          initialValue={resumeTemplate}
+          initialValue=""
           externalValue={externalValue}
           onChange={(v) => { prevLatexRef.current = v; setLatexSource(v) }}
           annotations={annotations}
@@ -255,14 +276,15 @@ export default function Home() {
 
   const rightPanel = (
     <div className="flex flex-col h-full">
-      <SplitPane direction="vertical" initialSplit={50} minSize={80} left={editorPanel} right={<PDFPreview />} />
+      <SplitPane direction="vertical" initialSplit={50} minSize={80} left={<JobDescriptionPanel />} right={<PDFPreview />} />
     </div>
   )
 
   return (
     <div className="flex flex-col h-full">
       <Header />
-      <SplitPane direction="horizontal" initialSplit={35} minSize={200} left={<JobDescriptionPanel />} right={rightPanel} />
+      <SplitPane direction="horizontal" initialSplit={50} minSize={300} left={editorPanel} right={rightPanel} />
+      <BankPanel open={bankOpen} onClose={() => setBankOpen(false)} />
     </div>
   )
 }

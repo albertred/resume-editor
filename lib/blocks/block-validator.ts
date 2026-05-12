@@ -25,6 +25,7 @@ export function validateBlockOps(
         if (!node) return fail(op, `targetId "${op.targetId}" not found on resume`)
         if (node.kind !== 'bullet') return fail(op, `targetId "${op.targetId}" is not a bullet`)
         if (op.targetId.startsWith('bank-')) return fail(op, 'replace_bullet cannot target bank IDs')
+        if (node.readOnly) return fail(op, 'targetId points to a read-only bullet (contains inline LaTeX)')
         return checkBulletText(op, op.text)
       }
 
@@ -40,6 +41,7 @@ export function validateBlockOps(
         const node = blockMap.get(op.targetId)
         if (!node) return fail(op, `targetId "${op.targetId}" not found on resume`)
         if (node.kind !== 'bullet') return fail(op, `targetId "${op.targetId}" is not a bullet`)
+        if (node.readOnly) return fail(op, 'targetId points to a read-only bullet')
         return ok(op)
       }
 
@@ -81,6 +83,25 @@ export function validateBlockOps(
         if (stray) return fail(op, `bank item "${stray}" not present in bank category "${op.categoryLabel}"`)
         return ok(op)
       }
+      case 'add_project_from_bank': {
+        const bankId = `proj-bank-${op.bankKey}`
+        const bankProject = bank.projects.find((p) => p.bankKey === op.bankKey || p.id === bankId)
+        if (!bankProject) return fail(op, `bankKey "${op.bankKey}" not found in project bank`)
+        // Don't duplicate: warn if already on the resume
+        const already = blocks.projects.find((p) => p.bankKey === op.bankKey)
+        if (already) return fail(op, `project "${op.bankKey}" is already on the resume`)
+        return ok(op)
+      }
+
+      case 'remove_banked_project': {
+        const node = blockMap.get(op.targetId)
+        if (!node) return fail(op, `targetId "${op.targetId}" not found on resume`)
+        if (!op.targetId.startsWith('proj-bank-')) {
+          return fail(op, 'remove_banked_project only targets \\addproject{} references')
+        }
+        return ok(op)
+      }
+
       default:
         return { op, valid: false, error: `unknown op type "${(op as { type?: string }).type ?? '?'}"` }
     }

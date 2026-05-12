@@ -124,15 +124,20 @@ Return a JSON object with exactly this shape:
    Add a full experience or project from the bank to the resume.
 7. \`add_skill_from_bank\`  — { type, categoryLabel, bankItems: string[], rationale }
    Append items from the bank's matching category into the resume's skills.
+8. \`add_project_from_bank\` — { type, bankKey, position?: number, rationale }
+   Add a project from the project bank by key. Renders as \\addproject{<bankKey>}. Use this for project entries from the BANK PROJECTS list below.
+9. \`remove_banked_project\` — { type, targetId, rationale }
+   Remove a \\addproject{} reference currently on the resume. targetId must be a banked project ID (starts with "proj-bank-").
 
 ## Hard rules
 
 1. \`targetId\` and \`afterId\` MUST come from RESUME IDs below.
-2. \`bankId\` and items in \`bankItems\` MUST come from BANK IDs / BANK SKILLS below.
-3. Never mix namespaces: a bank ID cannot be a target.
-4. TRUTHFULNESS: only rephrase, quantify, or surface things that already exist in the resume or the bank. Do NOT invent technologies, numbers, employers, or accomplishments.
-5. Maximum 8 operations total. Pick the highest-leverage edits.
-6. Return ONLY the JSON object, no markdown, no commentary.
+2. \`bankId\` and items in \`bankItems\` MUST come from BANK IDs / BANK SKILLS below; \`bankKey\` for \`add_project_from_bank\` MUST come from BANK PROJECTS.
+3. Never mix namespaces: a bank ID cannot be a target (except for \`remove_banked_project\` whose targetId is a "proj-bank-..." ID currently on the resume).
+4. READ-ONLY BULLETS: any bullet appearing in the resume JSON with \`"readOnly": true\` MUST NOT be a \`targetId\` for \`replace_bullet\` or \`delete_bullet\`. It contains hand-formatted LaTeX (links, icons, colors) that we can't safely rewrite. You may still insert new bullets into the same entry.
+5. TRUTHFULNESS: only rephrase, quantify, or surface things that already exist in the resume or the bank. Do NOT invent technologies, numbers, employers, or accomplishments.
+6. Maximum 8 operations total. Pick the highest-leverage edits.
+7. Return ONLY the JSON object, no markdown, no commentary.
 
 # RESUME IDs (valid for targetId / afterId)
 
@@ -172,10 +177,15 @@ ${JSON.stringify(bank, null, 2)}`
 
 function collectResumeIds(blocks: ResumeBlocks): string {
   const lines: string[] = []
-  const pushEntry = (label: string, entry: { id: string; bullets: { id: string; text: string }[] }, summary: string) => {
+  const pushEntry = (
+    label: string,
+    entry: { id: string; bullets: { id: string; text: string; readOnly?: boolean }[] },
+    summary: string,
+  ) => {
     lines.push(`  ${entry.id}  (${label}) — ${summary}`)
     for (const b of entry.bullets) {
-      lines.push(`    ${b.id}: ${truncate(stripBoldMarkers(b.text), 80)}`)
+      const tag = b.readOnly ? '  [READ-ONLY]' : ''
+      lines.push(`    ${b.id}${tag}: ${truncate(stripBoldMarkers(b.text), 80)}`)
     }
   }
   blocks.experience.forEach((e) =>
@@ -184,9 +194,13 @@ function collectResumeIds(blocks: ResumeBlocks): string {
   blocks.education.forEach((e) =>
     pushEntry('education', e, `${e.degree} — ${e.school}`),
   )
-  blocks.projects.forEach((p) =>
-    pushEntry('project', p, `${p.name} (${p.stack})`),
-  )
+  for (const p of blocks.projects) {
+    if (p.source === 'banked') {
+      lines.push(`  ${p.id}  (project, banked → ${p.bankKey}) — ${p.name}`)
+    } else {
+      pushEntry('project', p, `${p.name} (${p.stack})`)
+    }
+  }
   if (blocks.skills) lines.push(`  skills-0  (skills) — categories: ${blocks.skills.categories.map((c) => c.label).join(', ')}`)
   return lines.join('\n')
 }
@@ -195,11 +209,18 @@ function collectBankIds(bank: BankBlocks): string {
   const lines: string[] = []
   for (const e of bank.experience) {
     lines.push(`  ${e.id}  (experience) — ${e.role} @ ${e.company}, ${e.dates}`)
-    for (const b of e.bullets) lines.push(`    ${b.id}: ${truncate(stripBoldMarkers(b.text), 80)}`)
+    for (const b of e.bullets) {
+      const tag = b.readOnly ? '  [READ-ONLY]' : ''
+      lines.push(`    ${b.id}${tag}: ${truncate(stripBoldMarkers(b.text), 80)}`)
+    }
   }
   for (const p of bank.projects) {
-    lines.push(`  ${p.id}  (project) — ${p.name} (${p.stack})`)
-    for (const b of p.bullets) lines.push(`    ${b.id}: ${truncate(stripBoldMarkers(b.text), 80)}`)
+    const keyTag = p.bankKey ? ` key=${p.bankKey}` : ''
+    lines.push(`  ${p.id}  (project${keyTag}) — ${p.name} (${p.stack})`)
+    for (const b of p.bullets) {
+      const tag = b.readOnly ? '  [READ-ONLY]' : ''
+      lines.push(`    ${b.id}${tag}: ${truncate(stripBoldMarkers(b.text), 80)}`)
+    }
   }
   return lines.join('\n') || '  (bank is empty)'
 }

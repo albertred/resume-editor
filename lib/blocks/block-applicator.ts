@@ -49,11 +49,46 @@ export function applyBlockOp(
       case 'add_skill_from_bank':
         addSkillFromBank(next, op.categoryLabel, op.bankItems)
         break
+      case 'add_project_from_bank':
+        addProjectFromBank(next, bank, op.bankKey, op.position)
+        break
+      case 'remove_banked_project':
+        removeBankedProject(next, op.targetId)
+        break
     }
     return { newBlocks: next }
   } catch (err) {
     return { newBlocks: blocks, error: String(err) }
   }
+}
+
+function addProjectFromBank(
+  blocks: ResumeBlocks,
+  bank: BankBlocks,
+  bankKey: string,
+  position: number | undefined,
+): void {
+  const bankProject = bank.projects.find((p) => p.bankKey === bankKey || p.id === `proj-bank-${bankKey}`)
+  if (!bankProject) throw new Error(`Bank project "${bankKey}" not found`)
+  // Emit a minimal banked stub — renderer will produce \addproject{Key}
+  const stub: ProjectEntryBlock = {
+    kind: 'project-entry',
+    id: `proj-bank-${bankKey}`,
+    source: 'banked',
+    bankKey,
+    name: bankProject.name,
+    stack: bankProject.stack,
+    dates: '',
+    headingRaw: '',
+    bullets: [],
+  }
+  insertAt(blocks.projects, stub, position)
+}
+
+function removeBankedProject(blocks: ResumeBlocks, targetId: string): void {
+  const idx = blocks.projects.findIndex((p) => p.id === targetId)
+  if (idx === -1) throw new Error(`Banked project "${targetId}" not on resume`)
+  blocks.projects.splice(idx, 1)
 }
 
 // ---------------------------------------------------------------------------

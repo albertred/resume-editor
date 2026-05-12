@@ -3,6 +3,10 @@ import type {
   SectionNode,
   SubheadingNode,
   SkillsNode,
+  ItemNode,
+  ProjectHeadingNode,
+  BankedProjectNode,
+  EntryNode,
 } from '../latex/ast-types'
 import type {
   ResumeBlocks,
@@ -21,14 +25,14 @@ import type {
 export function astToBlocks(ast: ResumeAST): ResumeBlocks {
   return {
     header: parseHeader(ast.header),
-    experience: getSection(ast, 'experience').flatMap(toExperienceEntry),
-    education: getSection(ast, 'education').flatMap(toEducationEntry),
-    projects: getSection(ast, 'projects').flatMap(toProjectEntry),
-    skills: toSkills(getSection(ast, 'skills')),
+    experience: collect(ast, 'experience').flatMap(toExperienceEntry),
+    education: collect(ast, 'education').flatMap(toEducationEntry),
+    projects: collect(ast, 'projects').flatMap(toProjectEntry),
+    skills: toSkills(collect(ast, 'skills')),
   }
 }
 
-function getSection(ast: ResumeAST, type: SectionNode['type']): SectionNode['entries'] {
+function collect(ast: ResumeAST, type: SectionNode['type']): EntryNode[] {
   const section = ast.sections.find((s) => s.type === type)
   return section?.entries ?? []
 }
@@ -39,15 +43,16 @@ function getSection(ast: ResumeAST, type: SectionNode['type']): SectionNode['ent
 
 function parseHeader(header: string): { name: string; contact: string } {
   if (!header) return { name: '', contact: '' }
-  // Pull name from \textbf{\Huge \scshape NAME}
-  const nameMatch = header.match(/\\textbf\{[^}]*?\\scshape\s+([^}]+)\}/)
+  const nameMatch = header.match(/\\textbf\{[^}]*?\\scshape\s+([^}]+)\}/) ??
+    header.match(/\\scshape\s+([A-Z][A-Z\s.]+?)\}/)
   const name = nameMatch ? nameMatch[1].trim() : ''
-  // Take everything after the name's \\ as contact, strip LaTeX
   const contactRaw = header.replace(/.*?\\\\/, '').replace(/\\end\{center\}/, '')
   const contact = contactRaw
     .replace(/\\vspace\{[^}]*\}/g, '')
     .replace(/\\small/g, '')
     .replace(/\\href\{[^}]*\}\{([^}]*)\}/g, '$1')
+    .replace(/\\textcolor\{[^}]*\}\{([^}]*)\}/g, '$1')
+    .replace(/\\underline\{([^}]*)\}/g, '$1')
     .replace(/\$\|\$/g, '|')
     .replace(/\s+/g, ' ')
     .trim()
@@ -58,59 +63,169 @@ function parseHeader(header: string): { name: string; contact: string } {
 // Experience / Education / Projects entries
 // ---------------------------------------------------------------------------
 
-function toExperienceEntry(entry: SubheadingNode | SkillsNode): ExperienceEntryBlock[] {
+function toExperienceEntry(entry: EntryNode): ExperienceEntryBlock[] {
   if (entry.kind !== 'subheading') return []
+  // Experience uses 4-arg \resumeSubheading: {role}{dates}{company}{location}
   const [role, dates, company, location] = entry.args
   return [{
     kind: 'experience-entry',
     id: entry.id,
-    role: role.trim(),
-    dates: dates.trim(),
-    company: company.trim(),
-    location: location.trim(),
-    bullets: entry.items.map((item) => bulletFromItem(item.id, item.text)),
+    role: (role ?? '').trim(),
+    dates: (dates ?? '').trim(),
+    company: (company ?? '').trim(),
+    location: (location ?? '').trim(),
+    bullets: entry.items.map(bulletFromItem),
   }]
 }
 
-function toEducationEntry(entry: SubheadingNode | SkillsNode): EducationEntryBlock[] {
+function toEducationEntry(entry: EntryNode): EducationEntryBlock[] {
   if (entry.kind !== 'subheading') return []
-  // Education in the bundled template uses: {school}{location}{degree}{dates}
+  if (entry.variant === 'second') {
+    // 6-arg: {school}{location}{degreeLine}{dates}{extrasLabel}{extras}
+    const [school, location, degree, dates, extrasLabel, extras] = entry.args
+    const block: EducationEntryBlock = {
+      kind: 'education-entry',
+      id: entry.id,
+      variant: 'second',
+      school: (school ?? '').trim(),
+      location: (location ?? '').trim(),
+      degree: (degree ?? '').trim(),
+      dates: (dates ?? '').trim(),
+      extras: { label: (extrasLabel ?? '').trim(), items: (extras ?? '').trim() },
+      bullets: entry.items.map(bulletFromItem),
+    }
+    if (containsRichLatex(block.degree) || containsRichLatex(block.extras?.items ?? '')) {
+      block.readOnly = true
+    }
+    return [block]
+  }
+  // standard 4-arg: {school}{location}{degree}{dates}
   const [school, location, degree, dates] = entry.args
   return [{
     kind: 'education-entry',
     id: entry.id,
-    school: school.trim(),
-    location: location.trim(),
-    degree: degree.trim(),
-    dates: dates.trim(),
-    bullets: entry.items.map((item) => bulletFromItem(item.id, item.text)),
+    variant: 'standard',
+    school: (school ?? '').trim(),
+    location: (location ?? '').trim(),
+    degree: (degree ?? '').trim(),
+    dates: (dates ?? '').trim(),
+    bullets: entry.items.map(bulletFromItem),
   }]
 }
 
-function toProjectEntry(entry: SubheadingNode | SkillsNode): ProjectEntryBlock[] {
-  if (entry.kind !== 'subheading') return []
-  // Projects: {name}{link}{description}{stack}
-  const [name, link, description, stack] = entry.args
-  return [{
-    kind: 'project-entry',
-    id: entry.id,
-    name: name.trim(),
-    link: link.trim(),
-    description: description.trim(),
-    stack: stack.trim(),
-    bullets: entry.items.map((item) => bulletFromItem(item.id, item.text)),
-  }]
+function toProjectEntry(entry: EntryNode): ProjectEntryBlock[] {
+  if (entry.kind === 'project-heading') {
+    const heading = entry.heading ?? ''
+    return [{
+      kind: 'project-entry',
+      id: entry.id,
+      source: 'inline',
+      name: extractProjectName(heading),
+      stack: extractEmphContent(heading),
+      dates: (entry.dates ?? '').trim(),
+      headingRaw: heading,
+      bullets: entry.items.map(bulletFromItem),
+    }]
+  }
+  if (entry.kind === 'banked-project') {
+    return [{
+      kind: 'project-entry',
+      id: entry.id,
+      source: 'banked',
+      bankKey: entry.bankKey,
+      name: entry.bankKey,
+      stack: '',
+      dates: '',
+      headingRaw: '',
+      bullets: [],
+    }]
+  }
+  // Legacy: \resumeSubheading inside Projects (4-arg) — preserve as inline.
+  if (entry.kind === 'subheading') {
+    const [name, link, description, stack] = entry.args
+    return [{
+      kind: 'project-entry',
+      id: entry.id,
+      source: 'inline',
+      name: (name ?? '').trim(),
+      stack: (stack ?? '').trim(),
+      dates: (link ?? '').trim(),
+      headingRaw: `\\textbf{${name ?? ''}} | \\emph{${stack ?? ''}}`,
+      bullets: entry.items.map(bulletFromItem),
+    }]
+  }
+  return []
 }
 
-function bulletFromItem(id: string, rawText: string): BulletBlock {
-  return { kind: 'bullet', id, text: latexToBulletText(rawText) }
+/** Pull the first \textbf{...} content out of a heading as a display name. */
+function extractProjectName(heading: string): string {
+  const m = heading.match(/\\textbf\{([^}]+)\}/)
+  if (m) return m[1].replace(/\\scriptsize\{[^}]*\}/g, '').trim()
+  return heading.slice(0, 60).trim()
+}
+
+function extractEmphContent(heading: string): string {
+  const m = heading.match(/\\emph\{([^}]+)\}/)
+  return m ? m[1].trim() : ''
 }
 
 // ---------------------------------------------------------------------------
-// Bullet text conversion: LaTeX → block-text
+// Bullet ingestion
+// ---------------------------------------------------------------------------
+
+function bulletFromItem(item: ItemNode): BulletBlock {
+  const raw = item.text
+  if (containsRichLatex(raw)) {
+    return {
+      kind: 'bullet',
+      id: item.id,
+      text: latexToDisplayText(raw),
+      readOnly: true,
+      raw,
+    }
+  }
+  return { kind: 'bullet', id: item.id, text: latexToBulletText(raw) }
+}
+
+/**
+ * True if the LaTeX contains commands we can't safely round-trip through the
+ * block model. \textbf is the one allowed command (round-trips as \b{...}).
+ */
+function containsRichLatex(text: string): boolean {
+  // Strip \textbf{...} occurrences (they're fine) then look for any \word
+  let stripped = text
+  // remove \textbf{...} (non-nested approximation)
+  let prev = ''
+  while (prev !== stripped) {
+    prev = stripped
+    stripped = stripped.replace(/\\textbf\{[^{}]*\}/g, '')
+  }
+  // remove escaped \% \& \$ \# \_ \{ \}
+  stripped = stripped.replace(/\\[&%$#_{}]/g, '')
+  return /\\[A-Za-z]+/.test(stripped)
+}
+
+/** Render rich LaTeX to a plain display approximation (for the LLM's context). */
+function latexToDisplayText(latex: string): string {
+  return latex
+    .replace(/\\href\{[^}]*\}\{([^}]*)\}/g, '$1')
+    .replace(/\\textcolor\{[^}]*\}\{([^}]*)\}/g, '$1')
+    .replace(/\\underline\{([^}]*)\}/g, '$1')
+    .replace(/\\textbf\{([^}]*)\}/g, '$1')
+    .replace(/\\textit\{([^}]*)\}/g, '$1')
+    .replace(/\\emph\{([^}]*)\}/g, '$1')
+    .replace(/\\scriptsize\{[^}]*\}/g, '')
+    .replace(/\\faLink\\?/g, '')
+    .replace(/\\[A-Za-z]+\{?/g, '')
+    .replace(/\}/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// ---------------------------------------------------------------------------
+// Bullet text conversion (editable bullets only): LaTeX → block-text
 //   \textbf{X}  →  \b{X}
-//   \%, \&, \$, \#, \_  →  %, &, $, #, _      (un-escape so the LLM sees plain text)
-// Anything else is left as-is (we'll catch stray commands in the validator).
+//   \%, \&, \$, \#, \_  →  %, &, $, #, _
 // ---------------------------------------------------------------------------
 
 export function latexToBulletText(latex: string): string {
@@ -125,7 +240,6 @@ export function latexToBulletText(latex: string): string {
       i = close + 1
       continue
     }
-    // Un-escape special chars
     if (latex[i] === '\\' && i + 1 < latex.length && '&%$#_{}'.includes(latex[i + 1])) {
       out += latex[i + 1]
       i += 2
@@ -154,7 +268,7 @@ function findMatchingBrace(s: string, openPos: number): number {
 // Skills
 // ---------------------------------------------------------------------------
 
-function toSkills(entries: (SubheadingNode | SkillsNode)[]): SkillsBlock | null {
+function toSkills(entries: EntryNode[]): SkillsBlock | null {
   const skillsEntry = entries.find((e): e is SkillsNode => e.kind === 'skills')
   if (!skillsEntry) return null
   return {
@@ -167,18 +281,19 @@ function toSkills(entries: (SubheadingNode | SkillsNode)[]): SkillsBlock | null 
 /**
  * Parse skills lines that look like:
  *   \textbf{Languages}{: Python, JavaScript, TypeScript}
- * Returns one category per line.
+ * Skips lines starting with `%` (commented-out categories).
  */
 export function parseSkillCategories(raw: string): SkillsCategory[] {
   const categories: SkillsCategory[] = []
-  const re = /\\textbf\{([^}]+)\}\{:\s*([^}]*)\}/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(raw)) !== null) {
+  // Match \textbf{label}{: items}, but only on non-commented lines
+  const lines = raw.split('\n')
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (trimmed.startsWith('%')) continue
+    const m = trimmed.match(/\\textbf\{([^}]+)\}\{:\s*([^}]*)\}/)
+    if (!m) continue
     const label = m[1].trim()
-    const items = m[2]
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)
+    const items = m[2].split(',').map((s) => s.trim()).filter(Boolean)
     categories.push({ label, items })
   }
   return categories

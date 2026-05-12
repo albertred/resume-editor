@@ -12,8 +12,20 @@ export interface BulletBlock {
   kind: 'bullet'
   /** Stable ID inherited from the AST, e.g. "exp-0-item-2" */
   id: string
-  /** Plain text; may contain inline \b{...} bold markers */
+  /**
+   * Display text. For editable bullets this is the plain-text form with
+   * inline \b{...} bold markers. For read-only bullets this is a plain-text
+   * approximation suitable for display; the renderer emits `raw` instead.
+   */
   text: string
+  /**
+   * True if this bullet contains inline LaTeX commands we can't safely round-
+   * trip through the block model (e.g. \href, \textcolor, \faLink, \emph).
+   * The LLM may NOT target this bullet with replace_bullet or delete_bullet.
+   */
+  readOnly?: boolean
+  /** Original LaTeX (verbatim). Present iff readOnly; used by the renderer. */
+  raw?: string
 }
 
 export interface ExperienceEntryBlock {
@@ -31,21 +43,42 @@ export interface EducationEntryBlock {
   kind: 'education-entry'
   /** "edu-0", "edu-1", … */
   id: string
+  /** 'standard' = 4-arg \resumeSubheading, 'second' = 6-arg \resumeSubheadingSecond */
+  variant: 'standard' | 'second'
   school: string
   location: string
+  /** For 'second' this holds the full degree line incl. cumulative average (raw, may contain LaTeX). */
   degree: string
   dates: string
+  /** Present only on variant 'second': the 5th + 6th args (extras label + items, raw). */
+  extras?: { label: string; items: string }
+  /** True if any structural field above contains inline LaTeX — entry is read-only to the LLM. */
+  readOnly?: boolean
   bullets: BulletBlock[]
 }
 
 export interface ProjectEntryBlock {
   kind: 'project-entry'
-  /** "proj-0", "proj-1", … */
+  /** "proj-0", "proj-1", … for inline; "proj-bank-<Key>" for \addproject. */
   id: string
+  /** 'inline' = full \resumeProjectHeading{...} block; 'banked' = \addproject{Key} reference. */
+  source: 'inline' | 'banked'
+  /** For 'banked': the project key referenced from projects.tex. */
+  bankKey?: string
+  /**
+   * Display name parsed best-effort from the heading. For LLM context only;
+   * the renderer emits `headingRaw` verbatim for inline projects.
+   */
   name: string
-  link: string
-  description: string
+  /** Best-effort stack parsed from \emph{...}; display only. */
   stack: string
+  /** Best-effort dates (2nd arg of \resumeProjectHeading). */
+  dates: string
+  /**
+   * Raw first arg of \resumeProjectHeading (often contains \href, \emph, \faLink).
+   * Always treated as read-only for the renderer to preserve formatting.
+   */
+  headingRaw: string
   bullets: BulletBlock[]
 }
 

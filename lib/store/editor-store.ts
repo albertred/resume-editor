@@ -6,6 +6,9 @@ import { astToBlocks } from '../blocks/from-ast'
 import { blocksToLatex } from '../blocks/to-latex'
 import type { BankBlocks } from '../blocks/bank-types'
 import { masterBank } from '../blocks/master-bank'
+import { importFromComments } from '../blocks/import-from-comments'
+import { importProjectsTex } from '../blocks/project-bank'
+import { michelleResume } from '../templates/michelle-resume'
 import type {
   BlockEditOperation,
   BlockValidationResult,
@@ -13,6 +16,61 @@ import type {
 import { applyBlockOp } from '../blocks/block-applicator'
 
 export type { BlockEditOperation }
+
+const AUTOSAVE_KEY = 'resume-editor:autosave'
+const BANK_KEY = 'resume-editor:bank'
+
+function loadBank(): BankBlocks {
+  if (typeof window === 'undefined') return masterBank
+  try {
+    const raw = localStorage.getItem(BANK_KEY)
+    if (!raw) return masterBank
+    return JSON.parse(raw) as BankBlocks
+  } catch {
+    return masterBank
+  }
+}
+
+function persistBank(bank: BankBlocks) {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.setItem(BANK_KEY, JSON.stringify(bank))
+  } catch {
+    // ignore
+  }
+}
+
+function loadAutosave(): string | null {
+  if (typeof window === 'undefined') return null
+  try {
+    return localStorage.getItem(AUTOSAVE_KEY)
+  } catch {
+    return null
+  }
+}
+
+function persistAutosave(source: string) {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.setItem(AUTOSAVE_KEY, source)
+  } catch {
+    // localStorage full / disabled — silently drop
+  }
+}
+
+function clearAutosave() {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.removeItem(AUTOSAVE_KEY)
+  } catch {
+    // ignore
+  }
+}
+
+/** The string the app boots with — autosaved working copy, else bundled default. */
+export function initialResumeSource(): string {
+  return loadAutosave() ?? michelleResume
+}
 
 export interface SavedResume {
   id: string
@@ -62,6 +120,25 @@ interface EditorState {
   setEditorialBrief: (brief: string[]) => void
   acceptOp: (opId: string) => void
   rejectOp: (opId: string) => void
+  /** Discard local edits and restore the bundled default resume. */
+  resetToDefault: () => void
+  /** Replace the bank entirely (persists to localStorage). */
+  setBank: (bank: BankBlocks) => void
+  /**
+   * Scan the current resume for commented-out alternate entries, move them
+   * into the bank, and strip them from the source. Returns counts.
+   */
+  importAlternates: () => { experience: number; projects: number }
+  /** Import a projects.tex file's contents into the bank. */
+  importProjectsTexSource: (source: string) => number
+}
+
+// Debounced autosave so we don't hit localStorage on every keystroke.
+let autosaveTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleAutosave(source: string) {
+  if (typeof window === 'undefined') return
+  if (autosaveTimer) clearTimeout(autosaveTimer)
+  autosaveTimer = setTimeout(() => persistAutosave(source), 500)
 }
 
 export const useEditorStore = create<EditorState>((set, get) => ({
@@ -71,7 +148,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   pendingOps: [],
   ast: null,
   blocks: null,
-  bank: masterBank,
+  bank: loadBank(),
   activeAnnotationId: null,
   editorialBrief: [],
   savedResumes: loadLibrary(),
@@ -81,6 +158,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     const ast = parseResume(source)
     const blocks = ast.parseError ? null : astToBlocks(ast)
     set({ latexSource: source, ast, blocks })
+    scheduleAutosave(source)
   },
 
   setJobDescription: (jd) => {
@@ -147,5 +225,43 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     set((state) => ({
       pendingOps: state.pendingOps.filter((r) => r.op.id !== opId),
     }))
+  },
+
+  resetToDefault: () => {
+    clearAutosave()
+    const ast = parseResume(michelleResume)
+    const blocks = ast.parseError ? null : astToBlocks(ast)
+    set({
+      latexSource: michelleResume,
+      ast,
+      blocks,
+      pendingOps: [],
+      activeAnnotationId: null,
+      editorialBrief: [],
+    })
+  },
+
+  setBank: (bank) => {
+    persistBank(bank)
+    set({ bank })
+  },
+
+  importAlternates: () => {
+    const { latexSource, bank } = get()
+    const { bank: newBank, strippedSource, imported } = importFromComments(latexSource, bank)
+    persistBank(newBank)
+    const ast = parseResume(strippedSource)
+    const blocks = ast.parseError ? null : astToBlocks(ast)
+    set({ bank: newBank, latexSource: strippedSource, ast, blocks })
+    scheduleAutosave(strippedSource)
+    return imported
+  },
+
+  importProjectsTexSource: (source) => {
+    const { bank } = get()
+    const { bank: newBank, imported } = importProjectsTex(source, bank)
+    persistBank(newBank)
+    set({ bank: newBank })
+    return imported
   },
 }))
